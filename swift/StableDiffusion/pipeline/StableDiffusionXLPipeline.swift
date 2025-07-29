@@ -33,7 +33,10 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     
     /// Model used to latent space for image2image, and soon, in-painting
     var encoder: Encoder?
-    
+
+    /// Optional model used before Unet to control generated images by additonal inputs
+    var controlNet: ControlNetXL? = nil
+
     /// Option to reduce memory during image generation
     ///
     /// If true, the pipeline will lazily load TextEncoder, Unet, Decoder, and SafetyChecker
@@ -49,6 +52,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     ///   - textEncoder2: Second text encoding model
     ///   - unet: Model for noise prediction on latent samples
     ///   - decoder: Model for decoding latent sample to image
+    ///   - controlNet: Optional model to control generated images by additonal inputs
     ///   - reduceMemory: Option to enable reduced memory mode
     /// - Returns: Pipeline ready for image generation
     public init(
@@ -58,6 +62,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         unetRefiner: Unet?,
         decoder: Decoder,
         encoder: Encoder?,
+        controlNet: ControlNetXL? = nil,
         reduceMemory: Bool = false
     ) {
         self.textEncoder = textEncoder
@@ -66,6 +71,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         self.unetRefiner = unetRefiner
         self.decoder = decoder
         self.encoder = encoder
+        self.controlNet = controlNet
         self.reduceMemory = reduceMemory
     }
 
@@ -99,6 +105,12 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             } catch {
                 print("Error loading resources for vae encoder: \(error)")
             }
+
+            do {
+                try controlNet?.loadResources()
+            } catch {
+                print("Error loading resources for controlnet: \(error)")
+            }
         }
     }
 
@@ -110,6 +122,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         unetRefiner?.unloadResources()
         decoder.unloadResources()
         encoder?.unloadResources()
+        controlNet?.unloadResources()
     }
 
     /// Prewarm resources one at a time
@@ -134,6 +147,12 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             try encoder?.prewarmResources()
         } catch {
             print("Error prewarming resources for vae encoder: \(error)")
+        }
+
+        do {
+            try controlNet?.prewarmResources()
+        } catch {
+            print("Error prewarming resources for controlnet: \(error)")
         }
     }
     /// Image generation using stable diffusion
@@ -192,6 +211,15 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         let timestepStrength: Float? = config.mode == .imageToImage ? config.strength : nil
 
+        // Convert cgImage for ControlNet into MLShapedArray
+        let controlNetConds = try config.controlNetInputs.map { cgImage in
+            let shapedArray = try cgImage.planarRGBShapedArray(minValue: 0.0, maxValue: 1.0)
+            return MLShapedArray(
+                concatenating: [shapedArray, shapedArray],
+                alongAxis: 0
+            )
+        }
+
         // Store current model
         var unetModel = unet
         var currentInput = baseInput ?? refinerInput
@@ -230,6 +258,17 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 throw PipelineError.missingUnetInputs
             }
 
+            // Before Unet, execute controlNet and add the output into Unet inputs
+            let additionalResiduals = try controlNet?.execute(
+                latents: latentUnetInput,
+                timeStep: t,
+                hiddenStates: hiddenStates,
+                pooledStates: pooledStates,
+                geometryConditioning: geometryConditioning,
+                conditioningScale: config.controlNetConditioningScale,
+                images: controlNetConds
+            )
+
             // Predict noise residuals from latent samples
             // and current time step conditioned on hidden states
             var noise = try unetModel.predictNoise(
@@ -237,7 +276,8 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 timeStep: t,
                 hiddenStates: hiddenStates,
                 pooledStates: pooledStates,
-                geometryConditioning: geometryConditioning
+                geometryConditioning: geometryConditioning,
+                additionalResiduals: additionalResiduals
             )
 
             noise = performGuidance(noise, config.guidanceScale)
@@ -273,10 +313,10 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         // Unload resources
         if reduceMemory {
+            controlNet?.unloadResources()
             unet.unloadResources()
         }
         unetRefiner?.unloadResources()
-
 
         // Decode the latent samples to images
         return try decodeToImages(denoisedLatents, configuration: config)

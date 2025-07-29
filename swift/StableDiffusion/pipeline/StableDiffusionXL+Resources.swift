@@ -22,6 +22,10 @@ public extension StableDiffusionXLPipeline {
         public let encoderURL: URL
         public let vocabURL: URL
         public let mergesURL: URL
+        public let controlNetDirURL: URL
+        public let controlledUnetURL: URL
+        public let controlledUnetChunk1URL: URL
+        public let controlledUnetChunk2URL: URL
 
         public init(resourcesAt baseURL: URL) {
             textEncoderURL = baseURL.appending(path: "TextEncoder.mlmodelc")
@@ -36,6 +40,10 @@ public extension StableDiffusionXLPipeline {
             encoderURL = baseURL.appending(path: "VAEEncoder.mlmodelc")
             vocabURL = baseURL.appending(path: "vocab.json")
             mergesURL = baseURL.appending(path: "merges.txt")
+            controlNetDirURL = baseURL.appending(path: "controlnet")
+            controlledUnetURL = baseURL.appending(path: "ControlledUnet.mlmodelc")
+            controlledUnetChunk1URL = baseURL.appending(path: "ControlledUnetChunk1.mlmodelc")
+            controlledUnetChunk2URL = baseURL.appending(path: "ControlledUnetChunk2.mlmodelc")
         }
     }
 
@@ -50,6 +58,7 @@ public extension StableDiffusionXLPipeline {
     ///  Pipeline ready for image generation if all  necessary resources loaded
     init(
         resourcesAt baseURL: URL,
+        controlNet controlNetModelNames: [String],
         configuration config: MLModelConfiguration = .init(),
         reduceMemory: Bool = false
     ) throws {
@@ -67,6 +76,16 @@ public extension StableDiffusionXLPipeline {
         // padToken is different in the second XL text encoder
         let tokenizer2 = try BPETokenizer(mergesAt: urls.mergesURL, vocabularyAt: urls.vocabURL, padToken: "!")
         let textEncoder2 = TextEncoderXL(tokenizer: tokenizer2, modelAt: urls.textEncoder2URL, configuration: config)
+
+        // ControlNet model
+        var controlNet: ControlNetXL? = nil
+        let controlNetURLs = controlNetModelNames.map { model in
+            let fileName = model + ".mlmodelc"
+            return urls.controlNetDirURL.appending(path: fileName)
+        }
+        if !controlNetURLs.isEmpty {
+            controlNet = ControlNetXL(modelAt: controlNetURLs, configuration: config)
+        }
 
         // Unet model
         let unet: Unet
@@ -113,6 +132,7 @@ public extension StableDiffusionXLPipeline {
             unetRefiner: unetRefiner,
             decoder: decoder,
             encoder: encoder,
+            controlNet: controlNet,
             reduceMemory: reduceMemory
         )
     }

@@ -158,7 +158,8 @@ public struct Unet: ResourceManaging {
         timeStep: Int,
         hiddenStates: MLShapedArray<Float32>,
         pooledStates: MLShapedArray<Float32>,
-        geometryConditioning: MLShapedArray<Float32>
+        geometryConditioning: MLShapedArray<Float32>,
+        additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
     ) throws -> [MLShapedArray<Float32>] {
 
         // Match time step batch dimension to the model / latent samples
@@ -166,13 +167,18 @@ public struct Unet: ResourceManaging {
 
         // Form batch input to model
         let inputs = try latents.enumerated().map {
-            let dict: [String: Any] = [
+            var dict: [String: Any] = [
                 "sample" : MLMultiArray($0.element),
                 "timestep" : MLMultiArray(t),
                 "encoder_hidden_states": MLMultiArray(hiddenStates),
                 "text_embeds": MLMultiArray(pooledStates),
                 "time_ids": MLMultiArray(geometryConditioning)
             ]
+            if let residuals = additionalResiduals?[$0.offset] {
+                for (k, v) in residuals {
+                    dict[k] = MLMultiArray(v)
+                }
+            }
             return try MLDictionaryFeatureProvider(dictionary: dict)
         }
         let batch = MLArrayBatchProvider(array: inputs)
