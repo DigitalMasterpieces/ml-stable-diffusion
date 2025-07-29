@@ -38,6 +38,8 @@ public struct PipelineConfiguration: Hashable {
     public var guidanceScale: Float = 7.5
     /// List of Images for available ControlNet Models
     public var controlNetInputs: [CGImage] = []
+    /// ControlNet conditioning scale
+    public var controlNetConditioningScale: Float = 1.0
     /// Safety checks are only performed if `self.canSafetyCheck && !disableSafety`
     public var disableSafety: Bool = false
     /// Enables progress updates to decode `currentImages` from denoised latent images for better previews
