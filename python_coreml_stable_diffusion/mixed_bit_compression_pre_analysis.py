@@ -54,7 +54,7 @@ RANDOM_TEST_IMAGE_DATA = [
         "http://farm3.staticflickr.com/2238/2472574092_f5534bb2f7_z.jpg",
         "http://farm1.staticflickr.com/220/475442674_47d81fdc2c_z.jpg",
         "http://farm8.staticflickr.com/7231/7359341784_4c5358197f_z.jpg",
-        "http://farm8.staticflickr.com/7283/8737653089_d0c77b8597_z.jpg",
+        #"http://farm8.staticflickr.com/7283/8737653089_d0c77b8597_z.jpg",
         "http://farm3.staticflickr.com/2454/3989339438_2f32b76ebb_z.jpg",
         "http://farm1.staticflickr.com/34/123005230_13051344b1_z.jpg",
 ]]
