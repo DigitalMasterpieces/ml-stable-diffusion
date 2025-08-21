@@ -3,6 +3,8 @@
 # Copyright (C) 2022 Apple Inc. All Rights Reserved.
 #
 
+from typing import Optional
+
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers import ModelMixin
 
@@ -75,6 +77,7 @@ class ControlNetModel(ModelMixin, ConfigMixin):
         upcast_attention=False,
         resnet_time_scale_shift="default",
         conditioning_embedding_out_channels=(16, 32, 96, 256),
+        projection_class_embeddings_input_dim: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
@@ -114,6 +117,8 @@ class ControlNetModel(ModelMixin, ConfigMixin):
             timestep_input_dim,
             time_embed_dim,
         )
+
+        self.add_embedding = TimestepEmbedding(projection_class_embeddings_input_dim, time_embed_dim)
 
         # control net conditioning embedding
         self.controlnet_cond_embedding = ControlNetConditioningEmbedding(
@@ -186,6 +191,7 @@ class ControlNetModel(ModelMixin, ConfigMixin):
             resnet_groups=norm_num_groups,
             use_linear_projection=use_linear_projection,
             upcast_attention=upcast_attention,
+            transformer_layers_per_block=transformer_layers_per_block[-1],
         )
 
     def get_num_residuals(self):
