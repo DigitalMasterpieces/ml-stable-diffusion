@@ -126,6 +126,14 @@ def linear_to_conv2d_map(state_dict, prefix, local_metadata, strict,
         if 'weight' in k and len(state_dict[k].shape) == 2:
             state_dict[k] = state_dict[k][:, :, None, None]
 
+def conv2d_to_linear_map(state_dict, prefix, local_metadata, strict,
+                         missing_keys, unexpected_keys, error_msgs):
+    """ Squeeze twice to map nn.Conv2d weights to nn.Linear weights
+    """
+    for k in state_dict:
+        if 'weight' in k and len(state_dict[k].shape) == 4:
+            state_dict[k] = state_dict[k].squeeze(-1).squeeze(-1)
+
 # Note: torch.nn.LayerNorm and ane_transformers.reference.layer_norm.LayerNormANE
 # apply scale and bias terms in opposite orders. In order to accurately restore a
 # state_dict trained using the former into the the latter, we adjust the bias term
@@ -1162,6 +1170,7 @@ def get_down_block(
     resnet_act_fn,
     attn_num_head_channels,
     transformer_layers_per_block=1,
+    resnet_groups=32,
     cross_attention_dim=None,
     downsample_padding=None,
     add_downsample=True,
@@ -1176,6 +1185,7 @@ def get_down_block(
             temb_channels=temb_channels,
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
+            resnet_groups=resnet_groups,
             add_downsample=add_downsample,
         )
     elif down_block_type == "CrossAttnDownBlock2D":
@@ -1191,6 +1201,7 @@ def get_down_block(
             temb_channels=temb_channels,
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
+            resnet_groups=resnet_groups,
             downsample_padding=downsample_padding,
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
