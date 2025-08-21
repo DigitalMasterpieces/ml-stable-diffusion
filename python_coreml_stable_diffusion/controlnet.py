@@ -1,6 +1,7 @@
 #
 # For licensing see accompanying LICENSE.md file.
 # Copyright (C) 2022 Apple Inc. All Rights Reserved.
+# Copyright (C) 2025 Digital Masterpieces GmbH. All Rights Reserved.
 #
 
 from typing import Optional
