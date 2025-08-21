@@ -1,10 +1,11 @@
 #
 # For licensing see accompanying LICENSE.md file.
 # Copyright (C) 2022 Apple Inc. All Rights Reserved.
+# Copyright (C) 2025 Digital Masterpieces GmbH. All Rights Reserved.
 #
 
 from python_coreml_stable_diffusion import (
-    unet, controlnet, chunk_mlprogram
+    unet, controlnet, controlnetunion, chunk_mlprogram
 )
 
 import argparse
@@ -14,7 +15,8 @@ import coremltools as ct
 from diffusers import (
     StableDiffusionPipeline,
     DiffusionPipeline,
-    ControlNetModel
+    ControlNetModel,
+    ControlNetUnionModel
 )
 from diffusionkit.tests.torch2coreml import (
     convert_mmdit_to_mlpackage,
@@ -1351,6 +1353,22 @@ def convert_controlnet(pipe, args):
             )
             continue
 
+        # Import controlnet model and initialize reference controlnet
+        if args.union_controlnet:
+            original_controlnet = ControlNetUnionModel.from_pretrained(
+                controlnet_model_version,
+                use_auth_token=True
+            )
+            reference_controlnet = controlnetunion.ControlNetUnionModel(**original_controlnet.config).eval()
+        else:
+            original_controlnet = ControlNetModel.from_pretrained(
+                controlnet_model_version,
+                use_auth_token=True
+            )
+            reference_controlnet = controlnet.ControlNetModel(**original_controlnet.config).eval()
+
+        load_state_dict_summary = reference_controlnet.load_state_dict(original_controlnet.state_dict())
+
         if i == 0:
             batch_size = 2  # for classifier-free guidance
             sample_shape = (
@@ -1360,12 +1378,20 @@ def convert_controlnet(pipe, args):
                 (args.latent_w or pipe.unet.config.sample_size),  # W
             )
 
-            encoder_hidden_states_shape = (
-                batch_size,
-                args.text_encoder_hidden_size or pipe.text_encoder.config.hidden_size,
-                1,
-                args.text_token_sequence_length or pipe.text_encoder.config.max_position_embeddings,
-            )
+            if args.union_controlnet:
+                encoder_hidden_states_shape = (
+                    batch_size,
+                    reference_controlnet.config.cross_attention_dim or args.text_encoder_hidden_size or pipe.text_encoder.config.hidden_size,
+                    1,
+                    args.text_token_sequence_length or pipe.text_encoder.config.max_position_embeddings,
+                )
+            else:
+                encoder_hidden_states_shape = (
+                    batch_size,
+                    reference_controlnet.config.cross_attention_dim or args.text_encoder_hidden_size or pipe.text_encoder.config.hidden_size,
+                    1,
+                    args.text_token_sequence_length or pipe.text_encoder.config.max_position_embeddings,
+                )
 
             controlnet_cond_shape = (
                 batch_size,                                           # B
@@ -1385,12 +1411,38 @@ def convert_controlnet(pipe, args):
                 torch.tensor([pipe.scheduler.timesteps[0].item()] *
                              (batch_size)).to(torch.float32)),
                 ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
-                ("controlnet_cond", torch.rand(*controlnet_cond_shape)),
             ])
-            sample_controlnet_inputs_spec = {
-                k: (v.shape, v.dtype)
-                for k, v in sample_controlnet_inputs.items()
-            }
+
+            # Setup inputs
+            if args.union_controlnet:
+                num_control_type = reference_controlnet.config.num_control_type
+                for i in range(num_control_type):
+                    sample_controlnet_inputs['controlnet_cond_' + str(i)] = torch.rand(*controlnet_cond_shape)
+                control_mode = list(range(num_control_type))
+                control_type = torch.zeros(num_control_type).scatter_(0, torch.tensor(control_mode), 1)
+                control_type_repeat_factor = (
+                    batch_size
+                )
+                control_type = (
+                    control_type.reshape(1, -1)
+                    .to(torch.int32)
+                    .repeat(control_type_repeat_factor, 1)
+                )
+                sample_controlnet_inputs['control_type'] = control_type
+                sample_controlnet_inputs['control_type_idx'] = torch.tensor(control_mode).to(torch.int32)
+            else:
+                num_control_type = 1
+                sample_controlnet_inputs['controlnet_cond'] = torch.rand(*controlnet_cond_shape)
+
+            sample_controlnet_inputs_spec = {}
+            for k, v in sample_controlnet_inputs.items():
+                if isinstance(v, torch.Tensor):
+                    sample_controlnet_inputs_spec[k] = (v.shape, v.dtype)
+                elif isinstance(v, list) and all(isinstance(t, torch.Tensor) for t in v):
+                    sample_controlnet_inputs_spec[k] = ( [t.shape for t in v],
+                                                         [t.dtype for t in v] )
+                else:
+                    sample_controlnet_inputs_spec[k] = type(v)
             logger.info(
                 f"Sample ControlNet inputs spec: {sample_controlnet_inputs_spec}")
 
@@ -1399,17 +1451,15 @@ def convert_controlnet(pipe, args):
                 "encoder_hidden_states"] = baseline_sample_controlnet_inputs[
                     "encoder_hidden_states"].squeeze(2).transpose(1, 2)
 
-        # Import controlnet model and initialize reference controlnet
-        original_controlnet = ControlNetModel.from_pretrained(
-            controlnet_model_version,
-            use_auth_token=True
-        )
-        reference_controlnet = controlnet.ControlNetModel(**original_controlnet.config).eval()
-        load_state_dict_summary = reference_controlnet.load_state_dict(
-            original_controlnet.state_dict())
-
         num_residuals = reference_controlnet.get_num_residuals()
         output_keys = [f"additional_residual_{i}" for i in range(num_residuals)]
+
+        coreml_sample_controlnet_inputs = {
+            k: v.numpy().astype(np.float16) if isinstance(v, torch.Tensor)
+               else [t.numpy().astype(np.float16) for t in v] if isinstance(v, list)
+               else TypeError(f"Unsupported type for key '{k}': {type(v)}")
+            for k, v in sample_controlnet_inputs.items()
+        }
 
         # JIT trace
         logger.info("JIT tracing..")
@@ -1429,11 +1479,6 @@ def convert_controlnet(pipe, args):
         del original_controlnet
         gc.collect()
 
-        coreml_sample_controlnet_inputs = {
-            k: v.numpy().astype(np.float16)
-            for k, v in sample_controlnet_inputs.items()
-        }
-
         coreml_controlnet, out_path = _convert_to_coreml(f"controlnet_{controlnet_model_name}", reference_controlnet,
                                                    coreml_sample_controlnet_inputs,
                                                    output_keys, args,
@@ -1441,6 +1486,18 @@ def convert_controlnet(pipe, args):
 
         del reference_controlnet
         gc.collect()
+
+        # Make inputs optional (for Union ControlNets)
+        if args.union_controlnet:
+            spec = coreml_controlnet.get_spec()
+
+            # Loop over all inputs in the model description
+            for input_type in spec.description.input:
+                if "controlnet_cond" in input_type.name:
+                    input_type.type.isOptional = True
+
+            # Update model
+            coreml_controlnet = ct.models.MLModel(spec, weights_dir=coreml_controlnet.weights_dir)
 
         coreml_controlnet.author = f"Please refer to the Model Card available at huggingface.co/{controlnet_model_version}"
         coreml_controlnet.license = "OpenRAIL (https://huggingface.co/spaces/CompVis/stable-diffusion-license)"
@@ -1458,8 +1515,14 @@ def convert_controlnet(pipe, args):
             "Output embeddings from the associated text_encoder model to condition to generated image on text. " \
             "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. " \
             "Shorter text does not reduce computation."
-        coreml_controlnet.input_description["controlnet_cond"] = \
-            "An additional input image for ControlNet to condition the generated images."
+        if args.union_controlnet:
+            for i in range(num_control_type):
+                coreml_controlnet.input_description["controlnet_cond_" + str(i)] = \
+                "An additional input image for ControlNet to condition the generated images."
+            coreml_controlnet.input_description["control_type"] = \
+            "A tensor with values `0` or `1` depending on whether the control type is used."
+            coreml_controlnet.input_description["control_type_idx"] = \
+            "The indices of `control_type`."
 
         # Set the output descriptions
         for i in range(num_residuals):
@@ -1776,6 +1839,11 @@ def parser_spec():
         "--sd3-version",
         action="store_true",
         help=("If specified, the pre-trained model will be treated as an SD3 model."))
+    parser.add_argument(
+        "--union-controlnet",
+        action="store_true",
+        help=("If specified, the control net model will be treated as an instantiation of "
+        "`diffusers.models.controlnet.ControlNetUnionModel` instead of `diffusers.models.controlnet.ControlNetModel`"))
 
     return parser
 
