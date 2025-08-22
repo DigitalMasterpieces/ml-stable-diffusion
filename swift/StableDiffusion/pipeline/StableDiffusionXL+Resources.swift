@@ -59,6 +59,7 @@ public extension StableDiffusionXLPipeline {
     init(
         resourcesAt baseURL: URL,
         controlNet controlNetModelNames: [String],
+        controlNetUnion: Bool = false,
         configuration config: MLModelConfiguration = .init(),
         reduceMemory: Bool = false
     ) throws {
@@ -78,13 +79,17 @@ public extension StableDiffusionXLPipeline {
         let textEncoder2 = TextEncoderXL(tokenizer: tokenizer2, modelAt: urls.textEncoder2URL, configuration: config)
 
         // ControlNet model
-        var controlNet: ControlNetXL? = nil
+        var controlNet: ControlNetXLProtocol? = nil
         let controlNetURLs = controlNetModelNames.map { model in
             let fileName = model + ".mlmodelc"
             return urls.controlNetDirURL.appending(path: fileName)
         }
         if !controlNetURLs.isEmpty {
-            controlNet = ControlNetXL(modelAt: controlNetURLs, configuration: config)
+            if controlNetUnion {
+                controlNet = ControlNetUnionXL(modelAt: controlNetURLs, configuration: config)
+            } else {
+                controlNet = ControlNetXL(modelAt: controlNetURLs, configuration: config)
+            }
         }
 
         // Unet model

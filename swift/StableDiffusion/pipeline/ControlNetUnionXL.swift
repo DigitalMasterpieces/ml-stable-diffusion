@@ -6,7 +6,7 @@ import CoreML
 import Accelerate
 
 @available(iOS 16.2, macOS 13.1, *)
-public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
+public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
 
     public var models: [ManagedMLModel]
     
@@ -37,15 +37,17 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
             model.unloadResources()
         }
     }
-    
+
     public var inputImageDescriptions: [MLFeatureDescription] {
-        models.map { model in
+        models.flatMap { model in
             try! model.perform {
-                $0.modelDescription.inputDescriptionsByName["controlnet_cond"]!
+                $0.modelDescription.inputDescriptionsByName
+                    .filter { $0.key.hasPrefix("controlnet_cond_") }
+                    .map { $0.value }
             }
         }
     }
-    
+
     /// The expected shape of the models image input
     public var inputImageShapes: [[Int]] {
         inputImageDescriptions.map { desc in
@@ -80,7 +82,10 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
 
         // Initialize tensor for conditioning scale
         let conditioningScaleArray = MLShapedArray<Float32>(scalars: [conditioningScale], shape: [1])
-
+        guard let controlTypeArray = controlTypes else {
+            return []
+        }
+        
         var outputs: [[String: MLShapedArray<Float32>]] = []
         
         for (modelIndex, model) in models.enumerated() {
@@ -89,14 +94,12 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
                     "sample": MLMultiArray(latent),
                     "timestep": MLMultiArray(t),
                     "encoder_hidden_states": MLMultiArray(hiddenStates),
-                    "controlnet_cond": MLMultiArray(images[modelIndex]),
-                    "time_ids": MLMultiArray(geometryConditioning),
-                    "text_embeds": MLMultiArray(pooledStates),
-                    "conditioning_scale": MLMultiArray(conditioningScaleArray)
+                    "controlnet_cond_3": MLMultiArray(images[modelIndex]),
+                    "control_type": MLMultiArray(controlTypeArray)
                 ]
                 return try MLDictionaryFeatureProvider(dictionary: dict)
             }
-            
+
             let batch = MLArrayBatchProvider(array: inputs)
             
             let results = try model.perform {
@@ -115,14 +118,30 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
                 let result = results.features(at: n)
                 for k in result.featureNames {
                     let newValue = result.featureValue(for: k)!.multiArrayValue!
+                    let count = newValue.count
+                    let inputPointer = newValue.dataPointer.assumingMemoryBound(to: Float.self)
+
                     if modelIndex == 0 {
-                        outputs[n][k] = MLShapedArray<Float32>(newValue)
+                        // scale first input directly into outputs
+                        var scaled = [Float](repeating: 0, count: count)
+                        vDSP_vsmul(inputPointer, 1,
+                                    [conditioningScale], &scaled, 1,
+                                    vDSP_Length(count))
+                        let scaledArray = try! MLMultiArray(shape: newValue.shape, dataType: .float32)
+                        let scaledPointer = scaledArray.dataPointer.assumingMemoryBound(to: Float.self)
+                        scaled.withUnsafeBufferPointer { buf in
+                            scaledPointer.assign(from: buf.baseAddress!, count: count)
+                        }
+                        outputs[n][k] = MLShapedArray<Float32>(scaledArray)
                     } else {
+                        // accumulate scaled values into outputs
                         let outputArray = MLMultiArray(outputs[n][k]!)
-                        let count = newValue.count
-                        let inputPointer = newValue.dataPointer.assumingMemoryBound(to: Float.self)
                         let outputPointer = outputArray.dataPointer.assumingMemoryBound(to: Float.self)
-                        vDSP_vadd(inputPointer, 1, outputPointer, 1, outputPointer, 1, vDSP_Length(count))
+                        vDSP_vsma(inputPointer, 1, [conditioningScale],
+                                    outputPointer, 1,
+                                    outputPointer, 1,
+                                    vDSP_Length(count))
+                                    // `vsma` does: output = input * scale + output
                     }
                 }
             }

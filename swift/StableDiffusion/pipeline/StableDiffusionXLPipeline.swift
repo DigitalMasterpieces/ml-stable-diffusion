@@ -35,7 +35,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     var encoder: Encoder?
 
     /// Optional model used before Unet to control generated images by additonal inputs
-    var controlNet: ControlNetXL? = nil
+    var controlNet: ControlNetXLProtocol? = nil
 
     /// Option to reduce memory during image generation
     ///
@@ -62,7 +62,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         unetRefiner: Unet?,
         decoder: Decoder,
         encoder: Encoder?,
-        controlNet: ControlNetXL? = nil,
+        controlNet: ControlNetXLProtocol? = nil,
         reduceMemory: Bool = false
     ) {
         self.textEncoder = textEncoder
@@ -259,6 +259,11 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             }
 
             // Before Unet, execute controlNet and add the output into Unet inputs
+            let controlTypesArray = MLShapedArray<Float32>(
+                scalars: Array(repeating: config.controlNetTypes.map { Float32($0) }, count: 2).flatMap { $0 },
+                shape: [2, config.controlNetTypes.count]
+            )
+
             let additionalResiduals = try controlNet?.execute(
                 latents: latentUnetInput,
                 timeStep: t,
@@ -266,6 +271,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 pooledStates: pooledStates,
                 geometryConditioning: geometryConditioning,
                 conditioningScale: config.controlNetConditioningScale,
+                controlTypes: controlTypesArray,
                 images: controlNetConds
             )
 
