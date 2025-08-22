@@ -106,6 +106,51 @@ class ControlNetConditioningEmbedding(nn.Module):
 
         return embedding
 
+def make_controlnet(num_control_types: int, **kwargs):
+    cond_args = ", ".join([f"controlnet_cond_{i}: torch.Tensor"
+                           for i in range(num_control_types)])
+    cond_list = ", ".join([f"controlnet_cond_{i}"
+                           for i in range(num_control_types)])
+
+    src = f"""
+def forward(
+    self,
+    sample: torch.Tensor,
+    timestep: Union[torch.Tensor, float, int],
+    encoder_hidden_states: torch.Tensor,
+    {cond_args},
+    control_type: torch.Tensor,
+    conditioning_scale: Union[float, List[float]] = 1.0,
+    class_labels: Optional[torch.Tensor] = None,
+    guess_mode: bool = False,
+):
+    control_inputs = [{cond_list}]
+    return ControlNetUnionModel.forward(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states,
+        control_inputs,
+        control_type,
+        conditioning_scale=conditioning_scale,
+        class_labels=class_labels,
+        guess_mode=guess_mode,
+    )
+"""
+
+    namespace = {}
+    exec(src, globals(), namespace)
+    forward_fn = namespace["forward"]
+
+    class ControlNetWrapper(ControlNetUnionModel):
+        def __init__(self, **inner_kwargs):
+            super().__init__(**inner_kwargs)
+
+    ControlNetWrapper.forward = forward_fn
+
+    return ControlNetWrapper(**kwargs)
+
+
 class ControlNetUnionModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     """
     A ControlNetUnion model.
@@ -421,16 +466,8 @@ class ControlNetUnionModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         sample: torch.Tensor,
         timestep: Union[torch.Tensor, float, int],
         encoder_hidden_states: torch.Tensor,
-        controlnet_cond_0: torch.Tensor,
-        controlnet_cond_1: torch.Tensor,
-        controlnet_cond_2: torch.Tensor,
-        controlnet_cond_3: torch.Tensor,
-        controlnet_cond_4: torch.Tensor,
-        controlnet_cond_5: torch.Tensor,
-        controlnet_cond_6: torch.Tensor,
-        controlnet_cond_7: torch.Tensor,
+        controlnet_cond: List[torch.Tensor],
         control_type: torch.Tensor,
-        control_type_idx: List[int],
         conditioning_scale: Union[float, List[float]] = 1.0,
         class_labels: Optional[torch.Tensor] = None,
         guess_mode: bool = False,
@@ -482,7 +519,7 @@ class ControlNetUnionModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 returned where the first element is the sample tensor.
         """
 
-        controlnet_cond = [controlnet_cond_0, controlnet_cond_1, controlnet_cond_2, controlnet_cond_3, controlnet_cond_4, controlnet_cond_5, controlnet_cond_6, controlnet_cond_7]
+        control_type_idx = list(range(len(controlnet_cond)))
 
         if isinstance(conditioning_scale, float):
             conditioning_scale = [conditioning_scale] * len(controlnet_cond)
@@ -626,4 +663,3 @@ class ControlNetUnionModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             mid_block_res_sample = torch.mean(mid_block_res_sample, dim=(2, 3), keepdim=True)
 
         return down_block_res_samples, mid_block_res_sample
-

@@ -1359,7 +1359,9 @@ def convert_controlnet(pipe, args):
                 controlnet_model_version,
                 use_auth_token=True
             )
-            reference_controlnet = controlnetunion.ControlNetUnionModel(**original_controlnet.config).eval()
+            # Call factory method with number of control types
+            num_control_types = original_controlnet.config.num_control_type
+            reference_controlnet = controlnetunion.make_controlnet(num_control_types=num_control_types, **original_controlnet.config).eval()
         else:
             original_controlnet = ControlNetModel.from_pretrained(
                 controlnet_model_version,
@@ -1429,7 +1431,6 @@ def convert_controlnet(pipe, args):
                     .repeat(control_type_repeat_factor, 1)
                 )
                 sample_controlnet_inputs['control_type'] = control_type
-                sample_controlnet_inputs['control_type_idx'] = torch.tensor(control_mode).to(torch.int32)
             else:
                 num_control_type = 1
                 sample_controlnet_inputs['controlnet_cond'] = torch.rand(*controlnet_cond_shape)
@@ -1521,8 +1522,6 @@ def convert_controlnet(pipe, args):
                 "An additional input image for ControlNet to condition the generated images."
             coreml_controlnet.input_description["control_type"] = \
             "A tensor with values `0` or `1` depending on whether the control type is used."
-            coreml_controlnet.input_description["control_type_idx"] = \
-            "The indices of `control_type`."
 
         # Set the output descriptions
         for i in range(num_residuals):
