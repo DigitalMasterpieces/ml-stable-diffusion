@@ -73,30 +73,34 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
         hiddenStates: MLShapedArray<Float32>,
         pooledStates: MLShapedArray<Float32>,
         geometryConditioning: MLShapedArray<Float32>,
-        conditioningScale: Float,
-        controlTypes: MLShapedArray<Float32>?,
-        images: [MLShapedArray<Float32>]
+        conditioningScales: [[Float]],
+        controlTypes: [MLShapedArray<Float32>],
+        images: [[MLShapedArray<Float32>?]]
     ) throws -> [[String: MLShapedArray<Float32>]] {
         // Match time step batch dimension to the model / latent samples
         let t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
 
-        // Initialize tensor for conditioning scale
-        let conditioningScaleArray = MLShapedArray<Float32>(scalars: [conditioningScale], shape: [1])
-        guard let controlTypeArray = controlTypes else {
-            return []
-        }
-        
         var outputs: [[String: MLShapedArray<Float32>]] = []
         
         for (modelIndex, model) in models.enumerated() {
+            let controlTypeArray = controlTypes[modelIndex]
+
             let inputs = try latents.map { latent in
-                let dict: [String: Any] = [
+                var dict: [String: MLMultiArray] = [
                     "sample": MLMultiArray(latent),
                     "timestep": MLMultiArray(t),
                     "encoder_hidden_states": MLMultiArray(hiddenStates),
-                    "controlnet_cond_3": MLMultiArray(images[modelIndex]),
                     "control_type": MLMultiArray(controlTypeArray)
                 ]
+
+                // Map images to 'controlnet_cond_x' features
+                for (controlNetImageIndex, shapedArrayOpt) in images[modelIndex].enumerated() {
+                    if let shapedArray = shapedArrayOpt {
+                        let key = "controlnet_cond_\(controlNetImageIndex)"
+                        dict[key] = try MLMultiArray(shapedArray)
+                    }
+                }
+
                 return try MLDictionaryFeatureProvider(dictionary: dict)
             }
 
@@ -121,11 +125,13 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
                     let count = newValue.count
                     let inputPointer = newValue.dataPointer.assumingMemoryBound(to: Float.self)
 
+                    let conditioningScaleValue = conditioningScales[modelIndex].first!
+
                     if modelIndex == 0 {
                         // scale first input directly into outputs
                         var scaled = [Float](repeating: 0, count: count)
                         vDSP_vsmul(inputPointer, 1,
-                                    [conditioningScale], &scaled, 1,
+                                    [conditioningScaleValue], &scaled, 1,
                                     vDSP_Length(count))
                         let scaledArray = try! MLMultiArray(shape: newValue.shape, dataType: .float32)
                         let scaledPointer = scaledArray.dataPointer.assumingMemoryBound(to: Float.self)
@@ -137,7 +143,7 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
                         // accumulate scaled values into outputs
                         let outputArray = MLMultiArray(outputs[n][k]!)
                         let outputPointer = outputArray.dataPointer.assumingMemoryBound(to: Float.self)
-                        vDSP_vsma(inputPointer, 1, [conditioningScale],
+                        vDSP_vsma(inputPointer, 1, [conditioningScaleValue],
                                     outputPointer, 1,
                                     outputPointer, 1,
                                     vDSP_Length(count))

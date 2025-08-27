@@ -248,15 +248,18 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             encoder?.unloadResources()
         }
         let timestepStrength: Float? = config.mode == .imageToImage ? config.strength : nil
-        
+
         // Convert cgImage for ControlNet into MLShapedArray
-        let controlNetConds = try config.controlNetInputs.map { cgImage in
-            let shapedArray = try cgImage.planarRGBShapedArray(minValue: 0.0, maxValue: 1.0)
-            return MLShapedArray(
-                concatenating: [shapedArray, shapedArray],
-                alongAxis: 0
-            )
-        }
+        let controlNetConds: [MLShapedArray<Float32>] = try config.controlNetInputs.map { modelImages in
+            if let cgImage = modelImages.first,
+               let shapedArray = try cgImage?.planarRGBShapedArray(minValue: 0.0, maxValue: 1.0) {
+                return MLShapedArray(
+                    concatenating: [shapedArray, shapedArray],
+                    alongAxis: 0
+                )
+            }
+            return nil
+        }.compactMap{ $0 }
 
         // De-noising loop
         let timeSteps: [Int] = scheduler[0].calculateTimesteps(strength: timestepStrength)

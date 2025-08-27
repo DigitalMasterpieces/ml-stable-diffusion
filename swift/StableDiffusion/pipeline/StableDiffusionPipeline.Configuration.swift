@@ -37,11 +37,11 @@ public struct PipelineConfiguration: Hashable {
     /// Controls the influence of the text prompt on sampling process (0=random images)
     public var guidanceScale: Float = 7.5
     /// List of Images for available ControlNet Models
-    public var controlNetInputs: [CGImage] = []
+    public var controlNetInputs: [[CGImage?]] = []
     /// ControlNet conditioning scale
-    public var controlNetConditioningScale: Float = 1.0
+    public var controlNetConditioningScales: [[Float]] = []
     /// ControlNet types
-    public var controlNetTypes: [UInt] = []
+    public var controlNetTypes: [[UInt]] = []
     /// Safety checks are only performed if `self.canSafetyCheck && !disableSafety`
     public var disableSafety: Bool = false
     /// Enables progress updates to decode `currentImages` from denoised latent images for better previews

@@ -71,25 +71,30 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
         hiddenStates: MLShapedArray<Float32>,
         pooledStates: MLShapedArray<Float32>,
         geometryConditioning: MLShapedArray<Float32>,
-        conditioningScale: Float,
-        controlTypes: MLShapedArray<Float32>?,
-        images: [MLShapedArray<Float32>]
+        conditioningScales: [[Float]],
+        controlTypes: [MLShapedArray<Float32>],
+        images: [[MLShapedArray<Float32>?]]
     ) throws -> [[String: MLShapedArray<Float32>]] {
         // Match time step batch dimension to the model / latent samples
         let t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
 
-        // Initialize tensor for conditioning scale
-        let conditioningScaleArray = MLShapedArray<Float32>(scalars: [conditioningScale], shape: [1])
-
         var outputs: [[String: MLShapedArray<Float32>]] = []
         
         for (modelIndex, model) in models.enumerated() {
+            guard let imageInput = images[modelIndex].first! else {
+                outputs[modelIndex] = [:]
+                continue
+            }
+
+            // Initialize tensor for conditioning scale
+            let conditioningScaleArray = MLShapedArray<Float32>(scalars: [conditioningScales[modelIndex].first!], shape: [1])
+
             let inputs = try latents.map { latent in
                 let dict: [String: Any] = [
                     "sample": MLMultiArray(latent),
                     "timestep": MLMultiArray(t),
                     "encoder_hidden_states": MLMultiArray(hiddenStates),
-                    "controlnet_cond": MLMultiArray(images[modelIndex]),
+                    "controlnet_cond": MLMultiArray(imageInput),
                     "time_ids": MLMultiArray(geometryConditioning),
                     "text_embeds": MLMultiArray(pooledStates),
                     "conditioning_scale": MLMultiArray(conditioningScaleArray)

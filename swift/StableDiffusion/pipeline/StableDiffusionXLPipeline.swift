@@ -212,12 +212,16 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         let timestepStrength: Float? = config.mode == .imageToImage ? config.strength : nil
 
         // Convert cgImage for ControlNet into MLShapedArray
-        let controlNetConds = try config.controlNetInputs.map { cgImage in
-            let shapedArray = try cgImage.planarRGBShapedArray(minValue: 0.0, maxValue: 1.0)
-            return MLShapedArray(
-                concatenating: [shapedArray, shapedArray],
-                alongAxis: 0
-            )
+        let controlNetConds: [[MLShapedArray<Float32>?]] = try config.controlNetInputs.map { modelImages in
+            try modelImages.map { cgImageOpt in
+                if let shapedArray = try cgImageOpt?.planarRGBShapedArray(minValue: 0.0, maxValue: 1.0) {
+                    return MLShapedArray(
+                        concatenating: [shapedArray, shapedArray],
+                        alongAxis: 0
+                    )
+                }
+                return nil
+            }
         }
 
         // Store current model
@@ -259,10 +263,13 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             }
 
             // Before Unet, execute controlNet and add the output into Unet inputs
-            let controlTypesArray = MLShapedArray<Float32>(
-                scalars: Array(repeating: config.controlNetTypes.map { Float32($0) }, count: 2).flatMap { $0 },
-                shape: [2, config.controlNetTypes.count]
-            )
+            let controlTypesArray = config.controlNetTypes.map {
+                modelControlNetTypes in
+                MLShapedArray<Float32>(
+                    scalars: Array(repeating: modelControlNetTypes.map { Float32($0) }, count: 2).flatMap { $0 },
+                    shape: [2, modelControlNetTypes.count]
+                )
+            }
 
             let additionalResiduals = try controlNet?.execute(
                 latents: latentUnetInput,
@@ -270,7 +277,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 hiddenStates: hiddenStates,
                 pooledStates: pooledStates,
                 geometryConditioning: geometryConditioning,
-                conditioningScale: config.controlNetConditioningScale,
+                conditioningScales: config.controlNetConditioningScales,
                 controlTypes: controlTypesArray,
                 images: controlNetConds
             )

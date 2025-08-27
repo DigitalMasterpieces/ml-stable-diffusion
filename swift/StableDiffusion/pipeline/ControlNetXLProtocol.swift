@@ -26,8 +26,8 @@ public protocol ControlNetXLProtocol {
         hiddenStates: MLShapedArray<Float32>,
         pooledStates: MLShapedArray<Float32>,
         geometryConditioning: MLShapedArray<Float32>,
-        conditioningScale: Float,
-        controlTypes: MLShapedArray<Float32>?,
-        images: [MLShapedArray<Float32>]
+        conditioningScales: [[Float]],
+        controlTypes: [MLShapedArray<Float32>],
+        images: [[MLShapedArray<Float32>?]]
     ) throws -> [[String: MLShapedArray<Float32>]]
 }
