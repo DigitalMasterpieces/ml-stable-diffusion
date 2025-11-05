@@ -8,7 +8,7 @@ import CoreML
 public final class DiscreteFlowScheduler: Scheduler {
     public let trainStepCount: Int
     public let inferenceStepCount: Int
-    public var timeSteps = [Int]()
+    public var timeSteps = [Double]()
     public var betas = [Float]()
     public var alphas = [Float]()
     public var alphasCumProd = [Float]()
@@ -40,7 +40,7 @@ public final class DiscreteFlowScheduler: Scheduler {
 
         let sigmaDistribution = linspace(1, trainSteps, Int(trainSteps)).map { sigmaFromTimestep($0) }
         let timeStepDistribution = linspace(sigmaDistribution.first!, sigmaDistribution.last!, stepCount).reversed()
-        self.timeSteps = timeStepDistribution.map { Int($0 * trainSteps) }
+        self.timeSteps = timeStepDistribution.map { Double($0 * trainSteps) }
         self.sigmas = timeStepDistribution.map { sigmaFromTimestep($0 * trainSteps) }
     }
 
@@ -59,7 +59,7 @@ public final class DiscreteFlowScheduler: Scheduler {
     }
 
     /// Convert the model output to the corresponding type the algorithm needs.
-    func convertModelOutput(modelOutput: MLShapedArray<Float32>, timestep: Int, sample: MLShapedArray<Float32>) -> MLShapedArray<Float32> {
+    func convertModelOutput(modelOutput: MLShapedArray<Float32>, timestep: Double, sample: MLShapedArray<Float32>) -> MLShapedArray<Float32> {
         assert(modelOutput.scalarCount == sample.scalarCount)
         let stepIndex = timeSteps.firstIndex(of: timestep) ?? counter
         let sigma = sigmas[stepIndex]
@@ -86,7 +86,7 @@ public final class DiscreteFlowScheduler: Scheduler {
         return actualTimesteps
     }
 
-    public func step(output: MLShapedArray<Float32>, timeStep t: Int, sample: MLShapedArray<Float32>) -> MLShapedArray<Float32> {
+    public func step(output: MLShapedArray<Float32>, timeStep t: Double, sample: MLShapedArray<Float32>) -> MLShapedArray<Float32> {
         let stepIndex = timeSteps.firstIndex(of: t) ?? counter // TODO: allow float timesteps in scheduler step protocol
         let modelOutput = convertModelOutput(modelOutput: output, timestep: t, sample: sample)
         modelOutputs.append(modelOutput)

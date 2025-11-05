@@ -133,6 +133,7 @@ public extension StableDiffusionXLPipeline {
         self.init(
             textEncoder: textEncoder,
             textEncoder2: textEncoder2,
+            imageEncoder: nil,
             unet: unet,
             unetRefiner: unetRefiner,
             decoder: decoder,

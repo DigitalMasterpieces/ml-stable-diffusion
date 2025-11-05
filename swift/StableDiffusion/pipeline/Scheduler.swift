@@ -13,10 +13,10 @@ public protocol Scheduler {
     var inferenceStepCount: Int { get }
 
     /// Training diffusion time steps index by inference time step
-    var timeSteps: [Int] { get }
+    var timeSteps: [Double] { get }
 
     /// Training diffusion time steps index by inference time step
-    func calculateTimesteps(strength: Float?) -> [Int]
+    func calculateTimesteps(strength: Float?) -> [Double]
 
     /// Schedule of betas which controls the amount of noise added at each timestep
     var betas: [Float] { get }
@@ -44,14 +44,18 @@ public protocol Scheduler {
     ///   The state holds the current sample and history of model output noise residuals
     func step(
         output: MLShapedArray<Float32>,
-        timeStep t: Int,
+        timeStep t: Double,
         sample s: MLShapedArray<Float32>
     ) -> MLShapedArray<Float32>
+
+    func scaleModelInput(timeStep t: Double, sample: MLShapedArray<Float32>) -> MLShapedArray<Float32>
 }
 
 @available(iOS 16.2, macOS 13.1, *)
 public extension Scheduler {
     var initNoiseSigma: Float { 1 }
+
+    func scaleModelInput(timeStep: Double, sample: MLShapedArray<Float32>) -> MLShapedArray<Float32> { sample }
 }
 
 @available(iOS 16.2, macOS 13.1, *)
@@ -86,7 +90,7 @@ public extension Scheduler {
         strength: Float
     ) -> [MLShapedArray<Float32>] {
         let startStep = max(inferenceStepCount - Int(Float(inferenceStepCount) * strength), 0)
-        let alphaProdt = alphasCumProd[timeSteps[startStep]]
+        let alphaProdt = alphasCumProd[Int(timeSteps[startStep])]
         let betaProdt = 1 - alphaProdt
         let sqrtAlphaProdt = sqrt(alphaProdt)
         let sqrtBetaProdt = sqrt(betaProdt)
@@ -106,7 +110,7 @@ public extension Scheduler {
 
 @available(iOS 16.2, macOS 13.1, *)
 public extension Scheduler {
-    func calculateTimesteps(strength: Float?) -> [Int] {
+    func calculateTimesteps(strength: Float?) -> [Double] {
         guard let strength else { return timeSteps }
         let startStep = max(inferenceStepCount - Int(Float(inferenceStepCount) * strength), 0)
         let actualTimesteps = Array(timeSteps[startStep...])
@@ -140,7 +144,7 @@ public final class PNDMScheduler: Scheduler {
     public let betas: [Float]
     public let alphas: [Float]
     public let alphasCumProd: [Float]
-    public let timeSteps: [Int]
+    public let timeSteps: [Double]
 
     public let alpha_t: [Float]
     public let sigma_t: [Float]
@@ -187,14 +191,14 @@ public final class PNDMScheduler: Scheduler {
         let stepsOffset = 1 // For stable diffusion
         let stepRatio = Float(trainStepCount / stepCount )
         let forwardSteps = (0..<stepCount).map {
-            Int((Float($0) * stepRatio).rounded()) + stepsOffset
+            Double(Int((Float($0) * stepRatio).rounded()) + stepsOffset)
         }
 
         self.alpha_t = vForce.sqrt(self.alphasCumProd)
         self.sigma_t = vForce.sqrt(vDSP.subtract([Float](repeating: 1, count: self.alphasCumProd.count), self.alphasCumProd))
         self.lambda_t = zip(self.alpha_t, self.sigma_t).map { α, σ in log(α) - log(σ) }
 
-        var timeSteps: [Int] = []
+        var timeSteps: [Double] = []
         timeSteps.append(contentsOf: forwardSteps.dropLast(1))
         timeSteps.append(timeSteps.last!)
         timeSteps.append(forwardSteps.last!)
@@ -217,11 +221,11 @@ public final class PNDMScheduler: Scheduler {
     ///   The state holds the current sample and history of model output noise residuals
     public func step(
         output: MLShapedArray<Float32>,
-        timeStep t: Int,
+        timeStep t: Double,
         sample s: MLShapedArray<Float32>
     ) -> MLShapedArray<Float32> {
         
-        var timeStep = t
+        var timeStep = Int(t)
         let stepInc = (trainStepCount / inferenceStepCount)
         var prevStep = timeStep - stepInc
         var modelOutput = output
@@ -353,6 +357,11 @@ public final class PNDMScheduler: Scheduler {
 func linspace(_ start: Float, _ end: Float, _ count: Int) -> [Float] {
     let scale = (end - start) / Float(count - 1)
     return (0..<count).map { Float($0)*scale + start }
+}
+
+func linspaceD(_ start: Double, _ end: Double, _ count: Int) -> [Double] {
+    let scale = (end - start) / Double(count - 1)
+    return (0..<count).map { Double($0)*scale + start }
 }
 
 extension Collection {

@@ -89,7 +89,7 @@ public struct Unet: ResourceManaging {
     /// - Returns: Array of predicted noise residuals
     func predictNoise(
         latents: [MLShapedArray<Float32>],
-        timeStep: Int,
+        timeStep: Double,
         hiddenStates: MLShapedArray<Float32>,
         additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
     ) throws -> [MLShapedArray<Float32>] {
@@ -155,11 +155,13 @@ public struct Unet: ResourceManaging {
     @available(iOS 17.0, macOS 14.0, *)
     func predictNoise(
         latents: [MLShapedArray<Float32>],
-        timeStep: Int,
+        timeStep: Double,
         hiddenStates: MLShapedArray<Float32>,
         pooledStates: MLShapedArray<Float32>,
         geometryConditioning: MLShapedArray<Float32>,
-        additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
+        additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil,
+        imageEmbeds: MLShapedArray<Float32>? = nil,
+        ipAdapterScale: Float = 1.0
     ) throws -> [MLShapedArray<Float32>] {
 
         // Match time step batch dimension to the model / latent samples
@@ -178,6 +180,11 @@ public struct Unet: ResourceManaging {
                 for (k, v) in residuals {
                     dict[k] = MLMultiArray(v)
                 }
+            }
+            if let imageEmbeds = imageEmbeds {
+                let ipAdapterScaleArray = MLShapedArray<Float32>(scalars: [Float(ipAdapterScale)],shape: [1])
+                dict["image_embeds"] = MLMultiArray(imageEmbeds)
+                dict["ip_adapter_scale"] = MLMultiArray(ipAdapterScaleArray)
             }
             return try MLDictionaryFeatureProvider(dictionary: dict)
         }

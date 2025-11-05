@@ -52,7 +52,22 @@ public struct ControlNet: ResourceManaging {
             desc.multiArrayConstraint!.shape.map { $0.intValue }
         }
     }
-    
+
+    var outputDescriptions: [[String : MLFeatureDescription]] {
+        models.map { model in
+            try! model.perform {
+                $0.modelDescription.outputDescriptionsByName
+            }
+        }
+    }
+
+    /// The expected shape of the models outputs
+    public var outputShapes: [[String: [Int]]] {
+        outputDescriptions.map { desc in
+            desc.mapValues { $0.multiArrayConstraint!.shape.map { $0.intValue } }
+        }
+    }
+
     /// Calculate additional inputs for Unet to generate intended image following provided images
     ///
     /// - Parameters:
@@ -63,15 +78,15 @@ public struct ControlNet: ResourceManaging {
     /// - Returns: Array of predicted noise residuals
     func execute(
         latents: [MLShapedArray<Float32>],
-        timeStep: Int,
+        timeStep: Double,
         hiddenStates: MLShapedArray<Float32>,
         images: [MLShapedArray<Float32>]
     ) throws -> [[String: MLShapedArray<Float32>]] {
         // Match time step batch dimension to the model / latent samples
         let t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
-        
+
         var outputs: [[String: MLShapedArray<Float32>]] = []
-        
+
         for (modelIndex, model) in models.enumerated() {
             let inputs = try latents.map { latent in
                 let dict: [String: Any] = [
@@ -84,19 +99,13 @@ public struct ControlNet: ResourceManaging {
             }
             
             let batch = MLArrayBatchProvider(array: inputs)
-            
+
+            outputs = initOutputs(batch: latents.count, shapes: outputShapes[modelIndex])
+
             let results = try model.perform {
                 try $0.predictions(fromBatch: batch)
             }
-            
-            // pre-allocate MLShapedArray with a specific shape in outputs
-            if outputs.isEmpty {
-                outputs = initOutputs(
-                    batch: latents.count,
-                    shapes: results.features(at: 0).featureValueDictionary
-                )
-            }
-            
+
             for n in 0..<results.count {
                 let result = results.features(at: n)
                 for k in result.featureNames {
@@ -117,14 +126,15 @@ public struct ControlNet: ResourceManaging {
         return outputs
     }
     
-    private func initOutputs(batch: Int, shapes: [String: MLFeatureValue]) -> [[String: MLShapedArray<Float32>]] {
+    private func initOutputs(batch: Int, shapes: [String: [Int]]) -> [[String: MLShapedArray<Float32>]] {
         var output: [String: MLShapedArray<Float32>] = [:]
-        for (outputName, featureValue) in shapes {
+        for (outputName, shape) in shapes {
             output[outputName] = MLShapedArray<Float32>(
                 repeating: 0.0,
-                shape: featureValue.multiArrayValue!.shape.map { $0.intValue }
+                shape: shape
             )
         }
         return Array(repeating: output, count: batch)
     }
 }
+

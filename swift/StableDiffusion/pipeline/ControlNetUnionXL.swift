@@ -54,7 +54,22 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
             desc.multiArrayConstraint!.shape.map { $0.intValue }
         }
     }
-    
+
+    public var outputDescriptions: [[String : MLFeatureDescription]] {
+        models.map { model in
+            try! model.perform {
+                $0.modelDescription.outputDescriptionsByName
+            }
+        }
+    }
+
+    /// The expected shape of the models outputs
+    public var outputShapes: [[String: [Int]]] {
+        outputDescriptions.map { desc in
+            desc.mapValues { $0.multiArrayConstraint!.shape.map { $0.intValue } }
+        }
+    }
+
     /// Calculate additional inputs for Unet to generate intended image following provided images
     ///
     /// - Parameters:
@@ -69,12 +84,12 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
     /// - Returns: Array of predicted noise residuals
     public func execute(
         latents: [MLShapedArray<Float32>],
-        timeStep: Int,
+        timeStep: Double,
         hiddenStates: MLShapedArray<Float32>,
         pooledStates: MLShapedArray<Float32>,
         geometryConditioning: MLShapedArray<Float32>,
         conditioningScales: [[Float]],
-        controlTypes: [MLShapedArray<Float32>],
+        controlTypes: [[UInt]],
         images: [[MLShapedArray<Float32>?]]
     ) throws -> [[String: MLShapedArray<Float32>]] {
         // Match time step batch dimension to the model / latent samples
@@ -83,71 +98,65 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
         var outputs: [[String: MLShapedArray<Float32>]] = []
         
         for (modelIndex, model) in models.enumerated() {
-            let controlTypeArray = controlTypes[modelIndex]
+            // Initialize outputs.
+            outputs = initOutputs(batch: latents.count, shapes: outputShapes[modelIndex])
 
-            let inputs = try latents.map { latent in
-                var dict: [String: MLMultiArray] = [
-                    "sample": MLMultiArray(latent),
-                    "timestep": MLMultiArray(t),
-                    "encoder_hidden_states": MLMultiArray(hiddenStates),
-                    "control_type": MLMultiArray(controlTypeArray)
-                ]
+            // Run prediction for every control type that is activated.
+            for (controlID, controlType) in controlTypes[modelIndex].enumerated() {
+                let controlImage = images[modelIndex][controlID]
+                let conditioningScale = conditioningScales[modelIndex][controlID]
 
-                // Map images to 'controlnet_cond_x' features
-                for (controlNetImageIndex, shapedArrayOpt) in images[modelIndex].enumerated() {
-                    if let shapedArray = shapedArrayOpt {
-                        let key = "controlnet_cond_\(controlNetImageIndex)"
-                        dict[key] = try MLMultiArray(shapedArray)
-                    }
+                // Early out if image is not set or the conditioning scale is zero.
+                guard let controlImage = controlImage, conditioningScale > 0.0 else {
+                    continue
                 }
 
-                return try MLDictionaryFeatureProvider(dictionary: dict)
-            }
+                // Setup the control net type mask for the specific control ID
+                let controlNetTotalIDs = conditioningScales[modelIndex].count
+                let controlTypeIDMask: [UInt] = (0..<controlNetTotalIDs).map { $0 == controlID ? 1 : 0 }
+                let controlTypeIDMaskArray =
+                    MLShapedArray<Float32>(
+                        scalars: Array(repeating: controlTypeIDMask.map { Float32($0) }, count: 2).flatMap { $0 },
+                        shape: [2, controlTypeIDMask.count]
+                    )
 
-            let batch = MLArrayBatchProvider(array: inputs)
-            
-            let results = try model.perform {
-                try $0.predictions(fromBatch: batch)
-            }
-            
-            // pre-allocate MLShapedArray with a specific shape in outputs
-            if outputs.isEmpty {
-                outputs = initOutputs(
-                    batch: latents.count,
-                    shapes: results.features(at: 0).featureValueDictionary
-                )
-            }
-            
-            for n in 0..<results.count {
-                let result = results.features(at: n)
-                for k in result.featureNames {
-                    let newValue = result.featureValue(for: k)!.multiArrayValue!
-                    let count = newValue.count
-                    let inputPointer = newValue.dataPointer.assumingMemoryBound(to: Float.self)
+                let inputs = try latents.map { latent in
+                    var dict: [String: MLMultiArray] = [
+                        "sample": MLMultiArray(latent),
+                        "timestep": MLMultiArray(t),
+                        "encoder_hidden_states": MLMultiArray(hiddenStates),
+                        "control_type": MLMultiArray(controlTypeIDMaskArray),
+                        "controlnet_cond_\(controlID)": MLMultiArray(controlImage)
+                    ]
 
-                    let conditioningScaleValue = conditioningScales[modelIndex].first!
+                    return try MLDictionaryFeatureProvider(dictionary: dict)
+                }
 
-                    if modelIndex == 0 {
-                        // scale first input directly into outputs
-                        var scaled = [Float](repeating: 0, count: count)
-                        vDSP_vsmul(inputPointer, 1,
-                                    [conditioningScaleValue], &scaled, 1,
-                                    vDSP_Length(count))
+                let batch = MLArrayBatchProvider(array: inputs)
+
+                let results = try model.perform {
+                    try $0.predictions(fromBatch: batch)
+                }
+
+                for n in 0..<results.count {
+                    let result = results.features(at: n)
+                    for k in result.featureNames {
+                        let newValue = result.featureValue(for: k)!.multiArrayValue!
+
+                        let count = newValue.count
+                        let inputPointer = newValue.dataPointer.assumingMemoryBound(to: Float.self)
+
+                        // Accumulate scaled values into outputs.
                         let scaledArray = try! MLMultiArray(shape: newValue.shape, dataType: .float32)
                         let scaledPointer = scaledArray.dataPointer.assumingMemoryBound(to: Float.self)
-                        scaled.withUnsafeBufferPointer { buf in
-                            scaledPointer.assign(from: buf.baseAddress!, count: count)
-                        }
-                        outputs[n][k] = MLShapedArray<Float32>(scaledArray)
-                    } else {
-                        // accumulate scaled values into outputs
-                        let outputArray = MLMultiArray(outputs[n][k]!)
-                        let outputPointer = outputArray.dataPointer.assumingMemoryBound(to: Float.self)
-                        vDSP_vsma(inputPointer, 1, [conditioningScaleValue],
-                                    outputPointer, 1,
-                                    outputPointer, 1,
+
+                        // Direct scaling into MLMultiArray memory.
+                        vDSP_vsmul(inputPointer, 1,
+                                    [conditioningScale],
+                                    scaledPointer, 1,
                                     vDSP_Length(count))
-                                    // `vsma` does: output = input * scale + output
+
+                        outputs[n][k] = MLShapedArray<Float32>(scaledArray)
                     }
                 }
             }
@@ -155,13 +164,13 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
         
         return outputs
     }
-    
-    private func initOutputs(batch: Int, shapes: [String: MLFeatureValue]) -> [[String: MLShapedArray<Float32>]] {
+
+    private func initOutputs(batch: Int, shapes: [String: [Int]]) -> [[String: MLShapedArray<Float32>]] {
         var output: [String: MLShapedArray<Float32>] = [:]
-        for (outputName, featureValue) in shapes {
+        for (outputName, shape) in shapes {
             output[outputName] = MLShapedArray<Float32>(
                 repeating: 0.0,
-                shape: featureValue.multiArrayValue!.shape.map { $0.intValue }
+                shape: shape
             )
         }
         return Array(repeating: output, count: batch)

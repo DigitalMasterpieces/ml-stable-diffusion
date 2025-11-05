@@ -22,11 +22,14 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     var textEncoder: TextEncoderXLModel?
     var textEncoder2: TextEncoderXLModel
 
+    /// Model to generate embeddings for constraint image to be used with IP-Adapters
+    var imageEncoder: ImageEncoderXLModel?
+
     /// Model used to predict noise residuals given an input, diffusion time step, and conditional embedding
-    var unet: Unet
+    public var unet: Unet
     
     /// Model used to refine the image, if present
-    var unetRefiner: Unet?
+    public var unetRefiner: Unet?
 
     /// Model used to generate final image from latent diffusion process
     var decoder: Decoder
@@ -35,7 +38,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     var encoder: Encoder?
 
     /// Optional model used before Unet to control generated images by additonal inputs
-    var controlNet: ControlNetXLProtocol? = nil
+    public var controlNet: ControlNetXLProtocol? = nil
 
     /// Option to reduce memory during image generation
     ///
@@ -58,6 +61,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     public init(
         textEncoder: TextEncoderXLModel?,
         textEncoder2: TextEncoderXLModel,
+        imageEncoder: ImageEncoderXLModel?,
         unet: Unet,
         unetRefiner: Unet?,
         decoder: Decoder,
@@ -67,6 +71,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     ) {
         self.textEncoder = textEncoder
         self.textEncoder2 = textEncoder2
+        self.imageEncoder = imageEncoder
         self.unet = unet
         self.unetRefiner = unetRefiner
         self.decoder = decoder
@@ -84,6 +89,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             try prewarmResources()
         } else {
             try textEncoder2.loadResources()
+            try imageEncoder?.loadResources()
             try unet.loadResources()
             try decoder.loadResources()
 
@@ -118,6 +124,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     public func unloadResources() {
         textEncoder?.unloadResources()
         textEncoder2.unloadResources()
+        imageEncoder?.unloadResources()
         unet.unloadResources()
         unetRefiner?.unloadResources()
         decoder.unloadResources()
@@ -128,6 +135,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     /// Prewarm resources one at a time
     public func prewarmResources() throws {
         try textEncoder2.prewarmResources()
+        try imageEncoder?.prewarmResources()
         try unet.prewarmResources()
         try decoder.prewarmResources()
 
@@ -174,10 +182,20 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         // Setup geometry conditioning for base/refiner inputs
         var baseInput: ModelInputs?
         var refinerInput: ModelInputs?
+        var imageInputEmbeddings: ImageEncoderXLModel.ImageEncoderXLOutput?
 
         // Check if the first textEncoder is available, which is required for base models
         if textEncoder != nil {
             baseInput = try generateConditioning(using: config, forRefiner: isRefiner)
+        }
+
+        // Check if the imageEncoder is available
+        if let imageEncoder = self.imageEncoder {
+            if let imageInput = config.imageInput {
+                imageInputEmbeddings = try imageEncoder.encode(imageInput)
+            } else {
+                imageInputEmbeddings = MLShapedArray<Float32>(repeating: 0.0, shape: imageEncoder.imageEmbedsShape)
+            }
         }
 
         // Check if the refiner unet exists, or if the current unet is a refiner
@@ -188,14 +206,23 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         if reduceMemory {
             textEncoder?.unloadResources()
             textEncoder2.unloadResources()
+            imageEncoder?.unloadResources()
         }
 
         /// Setup schedulers
         let scheduler: [Scheduler] = (0..<config.imageCount).map { _ in
             switch config.schedulerType {
-            case .pndmScheduler: return PNDMScheduler(stepCount: config.stepCount)
-            case .dpmSolverMultistepScheduler: return DPMSolverMultistepScheduler(stepCount: config.stepCount, timeStepSpacing: config.schedulerTimestepSpacing)
-            case .discreteFlowScheduler: return DiscreteFlowScheduler(stepCount: config.stepCount, timeStepShift: config.schedulerTimestepShift)
+                case .pndmScheduler: return PNDMScheduler(stepCount: config.stepCount)
+                case .dpmSolverMultistepScheduler: return DPMSolverMultistepScheduler(stepCount: config.stepCount, timeStepSpacing: config.schedulerTimestepSpacing)
+                case .discreteFlowScheduler: return DiscreteFlowScheduler(stepCount: config.stepCount, timeStepShift: config.schedulerTimestepShift)
+                case .discreteEulerScheduler: return DiscreteEulerScheduler(
+                    strength: config.strength < 1.0 ? config.strength : nil,
+                    stepCount: config.stepCount,
+                    trainStepCount: 1000,
+                    betaSchedule: .scaledLinear,
+                    betaStart: 0.00085,
+                    betaEnd: 0.012,
+                    timestepSpacing: config.schedulerTimestepSpacing)
             }
         }
 
@@ -232,7 +259,15 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         var unetPooledStates = currentInput?.pooledStates
         var unetGeometryConditioning = currentInput?.geometryConditioning
 
-        let timeSteps: [Int] = scheduler[0].calculateTimesteps(strength: timestepStrength)
+        let timeSteps: [Double]
+
+        if let scheduler = scheduler[0] as? DiscreteEulerScheduler {
+            timeSteps = scheduler.timeSteps
+        } else {
+            timeSteps = scheduler[0].calculateTimesteps(strength: timestepStrength)
+        }
+
+        let timeStepsWrong = scheduler[0].calculateTimesteps(strength: timestepStrength)
 
         // Calculate which step to swap to refiner
         let refinerStartStep = Int(Float(timeSteps.count) * config.refinerStart)
@@ -241,8 +276,12 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         for (step,t) in timeSteps.enumerated() {
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
-            let latentUnetInput = latents.map {
+            var latentUnetInput = latents.map {
                 MLShapedArray<Float32>(concatenating: [$0, $0], alongAxis: 0)
+            }
+
+            for i in 0..<config.imageCount {
+                latentUnetInput[i] = scheduler[i].scaleModelInput(timeStep: t, sample: latentUnetInput[i])
             }
 
             // Switch to refiner if specified
@@ -262,15 +301,6 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 throw PipelineError.missingUnetInputs
             }
 
-            // Before Unet, execute controlNet and add the output into Unet inputs
-            let controlTypesArray = config.controlNetTypes.map {
-                modelControlNetTypes in
-                MLShapedArray<Float32>(
-                    scalars: Array(repeating: modelControlNetTypes.map { Float32($0) }, count: 2).flatMap { $0 },
-                    shape: [2, modelControlNetTypes.count]
-                )
-            }
-
             let additionalResiduals = try controlNet?.execute(
                 latents: latentUnetInput,
                 timeStep: t,
@@ -278,7 +308,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 pooledStates: pooledStates,
                 geometryConditioning: geometryConditioning,
                 conditioningScales: config.controlNetConditioningScales,
-                controlTypes: controlTypesArray,
+                controlTypes: config.controlNetTypes,
                 images: controlNetConds
             )
 
@@ -290,7 +320,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 hiddenStates: hiddenStates,
                 pooledStates: pooledStates,
                 geometryConditioning: geometryConditioning,
-                additionalResiduals: additionalResiduals
+                additionalResiduals: additionalResiduals,
+                imageEmbeds: imageInputEmbeddings,
+                ipAdapterScale: config.ipAdapterScale
             )
 
             noise = performGuidance(noise, config.guidanceScale)
@@ -418,21 +450,34 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     func generateLatentSamples(configuration config: Configuration, scheduler: Scheduler) throws -> [MLShapedArray<Float32>] {
         var sampleShape = unet.latentSampleShape
         sampleShape[0] = 1
-        
-        let stdev = scheduler.initNoiseSigma
+
         var random = randomSource(from: config.rngType, seed: config.seed)
-        let samples = (0..<config.imageCount).map { _ in
-            MLShapedArray<Float32>(
-                converting: random.normalShapedArray(sampleShape, mean: 0.0, stdev: Double(stdev)))
-        }
-        if let image = config.startingImage, config.mode == .imageToImage {
+
+        if let image = config.startingImage, config.mode == .imageToImage, config.strength < 1.0 {
             guard let encoder else {
                 throw PipelineError.startingImageProvidedWithoutEncoder
             }
+
+            let stdev = 1.0
+            let samples = (0..<config.imageCount).map { _ in
+                MLShapedArray<Float32>(
+                    converting: random.normalShapedArray(sampleShape, mean: 0.0, stdev: Double(stdev)))
+            }
+
             let latent = try encoder.encode(image, scaleFactor: config.encoderScaleFactor, random: &random)
-            return scheduler.addNoise(originalSample: latent, noise: samples, strength: config.strength)
+            if let scheduler = scheduler as? DiscreteEulerScheduler {
+                return scheduler.addNoise(originalSample: latent, noise: samples, timeStep: nil)
+            } else {
+                return scheduler.addNoise(originalSample: latent, noise: samples, strength: config.strength)
+            }
+        } else {
+            let stdev = scheduler.initNoiseSigma
+            let samples = (0..<config.imageCount).map { _ in
+                MLShapedArray<Float32>(
+                    converting: random.normalShapedArray(sampleShape, mean: 0.0, stdev: Double(stdev)))
+            }
+            return samples
         }
-        return samples
     }
 
     public func decodeToImages(_ latents: [MLShapedArray<Float32>], configuration config: Configuration) throws -> [CGImage?] {

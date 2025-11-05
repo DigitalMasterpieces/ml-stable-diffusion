@@ -20,14 +20,18 @@ public protocol ControlNetXLProtocol {
 
     var inputImageShapes: [[Int]] { get }
 
+    var outputDescriptions: [[String : MLFeatureDescription]] { get }
+
+    var outputShapes: [[String: [Int]]] { get }
+
     func execute(
         latents: [MLShapedArray<Float32>],
-        timeStep: Int,
+        timeStep: Double,
         hiddenStates: MLShapedArray<Float32>,
         pooledStates: MLShapedArray<Float32>,
         geometryConditioning: MLShapedArray<Float32>,
         conditioningScales: [[Float]],
-        controlTypes: [MLShapedArray<Float32>],
+        controlTypes: [[UInt]],
         images: [[MLShapedArray<Float32>?]]
     ) throws -> [[String: MLShapedArray<Float32>]]
 }
