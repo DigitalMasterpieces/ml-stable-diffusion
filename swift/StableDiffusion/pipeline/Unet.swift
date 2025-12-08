@@ -191,7 +191,12 @@ public struct Unet: ResourceManaging {
         let batch = MLArrayBatchProvider(array: inputs)
 
         // Make predictions
-        let results = try models.predictions(from: batch)
+        let results: MLBatchProvider
+        if models.count == 4 {
+            results = try models.unet_quad_predictions(from: batch)
+        } else {
+            results = try models.predictions(from: batch)
+        }
 
         // Pull out the results in Float32 format
         let noise = (0..<results.count).map { i in
@@ -213,5 +218,61 @@ public struct Unet: ResourceManaging {
         }
 
         return noise
+    }
+}
+
+@available(iOS 16.2, macOS 13.1, *)
+public extension Array where Element == ManagedMLModel {
+    /// Performs batch predictions for the Unet using an array `[ManagedMLModel]` with four instances in a pipeline.
+    /// - Parameter batch: Inputs for batched predictions.
+    /// - Returns: Final prediction results after processing through all models.
+    /// - Throws: Errors if the array is empty, predictions fail, or results can't be combined.
+    func unet_quad_predictions(from batch: MLBatchProvider) throws -> MLBatchProvider {
+        let dependencies: [[Int]] = [
+            [],       // stage 0
+            [0],      // stage 1 depends on output of stage 0
+            [1],      // stage 2 depends on output of stage 1
+            [0, 1, 2] // stage 3 depends on outputs of stage 1 and 2, etc.
+        ]
+
+        let inputs = batch.arrayOfFeatureValueDictionaries
+        var stageOutputs: [[[String: MLFeatureValue]]] = []   // cache outputs of all stages
+
+        // --- Stage 0 ---
+        var results = try self.first!.perform { model in
+            try model.predictions(fromBatch: batch)
+        }
+        stageOutputs.append(results.arrayOfFeatureValueDictionaries)
+
+        // --- Remaining stages ---
+        for (stageIndex, stage) in self.dropFirst().enumerated() {
+            let actualIndex = stageIndex + 1   // because dropFirst shifts indices
+
+            // Build merged inputs for this stage
+            let mergedInputDicts: [[String: MLFeatureValue]] =
+                (0..<inputs.count).map { sampleIndex in
+                    var merged = inputs[sampleIndex]   // start with original input
+
+                    // merge outputs of all dependencies (in order)
+                    for dep in dependencies[actualIndex] {
+                        let depDict = stageOutputs[dep][sampleIndex]
+                        for (k, v) in depDict { merged[k] = v }
+                    }
+                    return merged
+                }
+
+            let providers = try mergedInputDicts.map {
+                try MLDictionaryFeatureProvider(dictionary: $0)
+            }
+            let nextBatch = MLArrayBatchProvider(array: providers)
+
+            // predict
+            results = try stage.perform { model in
+                try model.predictions(fromBatch: nextBatch)
+            }
+            stageOutputs.append(results.arrayOfFeatureValueDictionaries)
+        }
+
+        return results
     }
 }
