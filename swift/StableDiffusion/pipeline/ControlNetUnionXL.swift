@@ -95,12 +95,9 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
         // Match time step batch dimension to the model / latent samples
         let t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
 
-        var outputs: [[String: MLShapedArray<Float32>]] = []
-        
-        for (modelIndex, model) in models.enumerated() {
-            // Initialize outputs.
-            outputs = initOutputs(batch: latents.count, shapes: outputShapes[modelIndex])
+        var outputs: [[String: MLShapedArray<Float32>]] = Array(repeating: [:], count: latents.count)
 
+        for (modelIndex, model) in models.enumerated() {
             // Run prediction for every control type that is activated.
             for (controlID, controlType) in controlTypes[modelIndex].enumerated() {
                 let controlImage = images[modelIndex][controlID]
@@ -161,18 +158,20 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
                 }
             }
         }
-        
+
+        // Initialize missing outputs.
+        for (outputName, shape) in self.outputShapes[0] {
+            for n in 0..<latents.count {
+                if outputs[n][outputName] == nil {
+                    outputs[n][outputName] = MLShapedArray<Float32>(
+                        repeating: 0.0,
+                        shape: shape
+                    )
+                }
+            }
+        }
+
         return outputs
     }
-
-    private func initOutputs(batch: Int, shapes: [String: [Int]]) -> [[String: MLShapedArray<Float32>]] {
-        var output: [String: MLShapedArray<Float32>] = [:]
-        for (outputName, shape) in shapes {
-            output[outputName] = MLShapedArray<Float32>(
-                repeating: 0.0,
-                shape: shape
-            )
-        }
-        return Array(repeating: output, count: batch)
-    }
 }
+

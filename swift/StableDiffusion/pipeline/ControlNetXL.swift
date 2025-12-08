@@ -93,15 +93,13 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
         // Match time step batch dimension to the model / latent samples
         let t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
 
-        var outputs: [[String: MLShapedArray<Float32>]] = []
+        var outputs: [[String: MLShapedArray<Float32>]] = Array(repeating: [:], count: latents.count)
 
         for (modelIndex, model) in models.enumerated() {
             
             guard let imageInput = images[modelIndex].first!,
                   let conditioningScale = conditioningScales[modelIndex].first
             else {
-                //outputs[modelIndex] = [:]
-                outputs = initOutputs(batch: latents.count, shapes: outputShapes[modelIndex])
                 continue
             }
 
@@ -118,8 +116,6 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
             }
             
             let batch = MLArrayBatchProvider(array: inputs)
-
-            outputs = initOutputs(batch: latents.count, shapes: outputShapes[modelIndex])
 
             let results = try model.perform {
                 try $0.predictions(fromBatch: batch)
@@ -157,18 +153,19 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
                 }
             }
         }
-        
-        return outputs
-    }
-    
-    private func initOutputs(batch: Int, shapes: [String: [Int]]) -> [[String: MLShapedArray<Float32>]] {
-        var output: [String: MLShapedArray<Float32>] = [:]
-        for (outputName, shape) in shapes {
-            output[outputName] = MLShapedArray<Float32>(
-                repeating: 0.0,
-                shape: shape
-            )
+
+        // Initialize missing outputs.
+        for (outputName, shape) in self.outputShapes[0] {
+            for n in 0..<latents.count {
+                if outputs[n][outputName] == nil {
+                    outputs[n][outputName] = MLShapedArray<Float32>(
+                        repeating: 0.0,
+                        shape: shape
+                    )
+                }
+            }
         }
-        return Array(repeating: output, count: batch)
+
+        return outputs
     }
 }
