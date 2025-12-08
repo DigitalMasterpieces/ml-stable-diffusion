@@ -2,6 +2,7 @@
 // Copyright (C) 2022 Apple Inc. All Rights Reserved.
 
 import CoreML
+import CryptoKit
 
 /// A class to manage and gate access to a Core ML model
 ///
@@ -66,11 +67,102 @@ public final class ManagedMLModel: ResourceManaging {
         }
     }
 
-    private func loadModel() throws {
-        if loadedModel == nil {
-            loadedModel = try MLModel(contentsOf: modelURL,
-                                      configuration: configuration)
+    /// Compute hash for a model at `modelURL`.
+    func cacheKey(for modelURL: URL) -> String {
+        let data = try! Data(contentsOf: modelURL)
+        let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return modelURL.deletingPathExtension().lastPathComponent + "_" + hash
+    }
+
+    /// Compute hash for a packaged model at `url`.
+    func cacheDirectoryKey(for url: URL) -> String {
+        let fm = FileManager.default
+        let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: nil)!
+
+        var hasher = SHA256()
+
+        for case let fileURL as URL in enumerator {
+            if (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                continue
+            }
+            if let data = try? Data(contentsOf: fileURL) {
+                hasher.update(data: data)
+            }
         }
+
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func loadModel() throws {
+        if loadedModel != nil { return }
+
+        let fm = FileManager.default
+
+        // Create persistent cache folder.
+        let supportDir = try fm.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let cacheDir = supportDir.appendingPathComponent("CompiledModels", isDirectory: true)
+        if !fm.fileExists(atPath: cacheDir.path) {
+            try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        }
+
+        // Extract base name (e.g., "TextEncoder2").
+        let baseName = modelURL.deletingPathExtension().lastPathComponent
+
+        // Compute a hash so updated bundled models force a fresh compile.
+        let hash: String
+        if modelURL.pathExtension == "mlpackage" {
+            hash = self.cacheDirectoryKey(for: modelURL)
+        } else {
+            hash = self.cacheKey(for: modelURL)
+        }
+
+        // Cache filename <BaseName>_<hash>.mlmodelc.
+        let cacheName = "\(baseName)_\(hash).mlmodelc"
+        let cachedModelURL = cacheDir.appendingPathComponent(cacheName)
+
+        // Cleanup: remove any old cached versions for this base model.
+        let cacheContents = try fm.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)
+        for url in cacheContents {
+            if url.lastPathComponent.hasPrefix(baseName + "_") &&
+                url.lastPathComponent != cacheName {
+                try? fm.removeItem(at: url)
+            }
+        }
+
+        // If cache missing → compile or copy.
+        if !fm.fileExists(atPath: cachedModelURL.path) {
+
+            if modelURL.pathExtension == "mlpackage" {
+                // Compile .mlpackage → .mlmodelc.
+                let compiled = try MLModel.compileModel(at: modelURL)
+                try fm.copyItem(at: compiled, to: cachedModelURL)
+
+            } else if modelURL.pathExtension == "mlmodelc" {
+                // Already compiled → copy.
+                try fm.copyItem(at: modelURL, to: cachedModelURL)
+
+            } else if modelURL.pathExtension == "mlmodel" {
+                // Raw → compile then cache.
+                let compiled = try MLModel.compileModel(at: modelURL)
+                try fm.copyItem(at: compiled, to: cachedModelURL)
+
+            } else {
+                throw NSError(
+                    domain: "ModelLoader",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Unsupported model type: \(modelURL)"]
+                )
+            }
+        }
+
+        // Load the cached compiled model.
+        loadedModel = try MLModel(contentsOf: cachedModelURL, configuration: configuration)
     }
 }
 
