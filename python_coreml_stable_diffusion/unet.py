@@ -8,6 +8,10 @@ from python_coreml_stable_diffusion import attention
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers import ModelMixin
+from diffusers.loaders import IPAdapterMixin
+
+from diffusers.models.embeddings import ImageProjection, IPAdapterPlusImageProjection, MultiIPAdapterImageProjection
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from enum import Enum
 
@@ -58,42 +62,21 @@ class Einsum(nn.Module):
         elif ATTENTION_IMPLEMENTATION_IN_EFFECT == AttentionImplementations.SPLIT_EINSUM_V2:
             return attention.split_einsum_v2(q, k, v, mask, self.heads, self.dim_head)
 
-
-class CrossAttention(nn.Module):
-    """ Apple Silicon friendly version of `diffusers.models.attention.CrossAttention`
+class AttnProcessor2_0(nn.Module):
+    """ Apple Silicon friendly version of `diffusers.models.attention_processor.AttnProcessor2_0`
     """
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64):
+    def __init__(self):
         super().__init__()
-        inner_dim = dim_head * heads
-        context_dim = context_dim if context_dim is not None else query_dim
+        self.ip_adapter_scale_additional = 1.0
 
-        self.scale = dim_head**-0.5
-        self.heads = heads
-        self.dim_head = dim_head
-
-        self.to_q = nn.Conv2d(query_dim, inner_dim, kernel_size=1, bias=False)
-        self.to_k = nn.Conv2d(context_dim,
-                              inner_dim,
-                              kernel_size=1,
-                              bias=False)
-        self.to_v = nn.Conv2d(context_dim,
-                              inner_dim,
-                              kernel_size=1,
-                              bias=False)
-        self.to_out = nn.Sequential(
-            nn.Conv2d(inner_dim, query_dim, kernel_size=1, bias=True))
-        self.einsum = Einsum(self.heads, self.dim_head)
-
-    def forward(self, hidden_states, context=None, mask=None):
-        # if self.training:
-        #     raise NotImplementedError(WARN_MSG)
-
+    def forward(self, attn, hidden_states, context=None, mask=None, ip_adapter_scale=None):
         batch_size, dim, _, sequence_length = hidden_states.shape
 
-        q = self.to_q(hidden_states)
+        q = attn.to_q(hidden_states)
+
         context = context if context is not None else hidden_states
-        k = self.to_k(context)
-        v = self.to_v(context)
+        k = attn.to_k(context)
+        v = attn.to_v(context)
 
         # Validate mask
         if mask is not None:
@@ -113,9 +96,114 @@ class CrossAttention(nn.Module):
                     f"Invalid shape for `mask` (Expected {expected_mask_shape}, got {list(mask.size())}"
                 )
 
-        attn = self.einsum(q, k, v, mask)
+        attn_einsum = attn.einsum(q, k, v, mask)
 
-        return self.to_out(attn)
+        return attn.to_out(attn_einsum)
+
+class IPAdapterAttnProcessor2_0(nn.Module):
+    """ Apple Silicon friendly version of `diffusers.models.attention_processor.IPAdapterAttnProcessor2_0`
+    """
+    def __init__(self, hidden_size, cross_attention_dim=None, num_tokens=(4,)):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.cross_attention_dim = cross_attention_dim
+
+        if not isinstance(num_tokens, (tuple, list)):
+            num_tokens = [num_tokens]
+        self.num_tokens = num_tokens
+
+        self.to_k_ip = nn.ModuleList(
+            [nn.Conv2d(cross_attention_dim, hidden_size, kernel_size=1, bias=False) for _ in range(len(num_tokens))]
+        )
+        self.to_v_ip = nn.ModuleList(
+            [nn.Conv2d(cross_attention_dim, hidden_size, kernel_size=1, bias=False) for _ in range(len(num_tokens))]
+        )
+
+        self.ip_adapter_scale_additional = torch.tensor([1.0])
+
+    def forward(self, attn, hidden_states, context=None, mask=None, ip_adapter_scale=None):
+        if ip_adapter_scale is None:
+            ip_adapter_scale = torch.ones(1, device=hidden_states.device, dtype=hidden_states.dtype)
+
+        q = attn.to_q(hidden_states)
+
+        # separate ip_hidden_states from encoder_hidden_states
+        if context is not None:
+            # unpack
+            encoder_hidden_states, ip_hidden_states = context
+
+            # text
+            k = attn.to_k(encoder_hidden_states)
+            v = attn.to_v(encoder_hidden_states)
+            attn_text = attn.einsum(q, k, v, mask)
+
+            # image (we only support one image prompt for now)
+            ip_hidden_states = [ip_hidden_states]
+            # also no mask support for now
+            ip_adapter_masks = [None] * len(self.to_k_ip)
+
+            for current_ip_hidden_states, to_k_ip, to_v_ip, mask in zip(
+                ip_hidden_states, self.to_k_ip, self.to_v_ip, ip_adapter_masks
+            ):
+                current_ip_hidden_states = current_ip_hidden_states
+
+                ip_key = to_k_ip(current_ip_hidden_states)
+                ip_value = to_v_ip(current_ip_hidden_states)
+
+                attn_image = attn.einsum(q, ip_key, ip_value, mask)
+
+                # assume ip_adapter_scale is a tensor scalar now, e.g. shape [1]
+                scale_tensor = ip_adapter_scale * self.ip_adapter_scale_additional
+
+                # expand/broadcast to attn_image shape
+                scale_tensor_expanded = scale_tensor.expand_as(attn_image)
+
+                # multiply safely
+                attn_einsum_sum = attn_text + attn_image * scale_tensor_expanded
+
+                return attn.to_out(attn_einsum_sum)
+
+
+class CrossAttention(nn.Module):
+    """ Apple Silicon friendly version of `diffusers.models.attention.CrossAttention`
+    """
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, hidden_size=None, cross_attention_dim=None):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context_dim = context_dim if context_dim is not None else query_dim
+
+        self.scale = dim_head**-0.5
+        self.heads = heads
+        self.dim_head = dim_head
+
+        self.to_q = nn.Conv2d(query_dim, inner_dim, kernel_size=1, bias=False)
+        self.to_k = nn.Conv2d(context_dim,
+                              inner_dim,
+                              kernel_size=1,
+                              bias=False)
+        self.to_v = nn.Conv2d(context_dim,
+                              inner_dim,
+                              kernel_size=1,
+                              bias=False)
+
+        if (hidden_size != None and cross_attention_dim != None):
+            self.processor = IPAdapterAttnProcessor2_0(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim
+            )
+        else:
+            self.processor = AttnProcessor2_0()
+
+        self.to_out = nn.Sequential(
+            nn.Conv2d(inner_dim, query_dim, kernel_size=1, bias=True))
+        self.einsum = Einsum(self.heads, self.dim_head)
+
+    def forward(self, hidden_states, context=None, mask=None, ip_adapter_scale=None):
+        return self.processor(self, hidden_states, context, mask, ip_adapter_scale)
+
+    def get_processor(self):
+        return self.processor
 
 
 def linear_to_conv2d_map(state_dict, prefix, local_metadata, strict,
@@ -175,7 +263,7 @@ class CrossAttnUpBlock2D(nn.Module):
         output_scale_factor=1.0,
         downsample_padding=1,
         add_upsample=True,
-        transformer_layers_per_block=1,
+        transformer_layers_per_block=1
     ):
         super().__init__()
         resnets = []
@@ -205,6 +293,7 @@ class CrossAttnUpBlock2D(nn.Module):
                     out_channels // attn_num_head_channels,
                     depth=transformer_layers_per_block,
                     context_dim=cross_attention_dim,
+                    cross_attention_dim=cross_attention_dim,
                 ))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
@@ -216,7 +305,8 @@ class CrossAttnUpBlock2D(nn.Module):
                 hidden_states,
                 res_hidden_states_tuple,
                 temb=None,
-                encoder_hidden_states=None):
+                encoder_hidden_states=None,
+                ip_adapter_scale=None):
         for resnet, attn in zip(self.resnets, self.attentions):
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
@@ -224,7 +314,7 @@ class CrossAttnUpBlock2D(nn.Module):
                                       dim=1)
 
             hidden_states = resnet(hidden_states, temb)
-            hidden_states = attn(hidden_states, context=encoder_hidden_states)
+            hidden_states = attn(hidden_states, context=encoder_hidden_states, ip_adapter_scale=ip_adapter_scale)
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
@@ -305,7 +395,7 @@ class CrossAttnDownBlock2D(nn.Module):
         attention_type="default",
         output_scale_factor=1.0,
         downsample_padding=1,
-        add_downsample=True,
+        add_downsample=True
     ):
         super().__init__()
         resnets = []
@@ -332,6 +422,7 @@ class CrossAttnDownBlock2D(nn.Module):
                     out_channels // attn_num_head_channels,
                     depth=transformer_layers_per_block,
                     context_dim=cross_attention_dim,
+                    cross_attention_dim=cross_attention_dim
                 ))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
@@ -341,12 +432,12 @@ class CrossAttnDownBlock2D(nn.Module):
         else:
             self.downsamplers = None
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None):
+    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, ip_adapter_scale=None):
         output_states = ()
 
         for resnet, attn in zip(self.resnets, self.attentions):
             hidden_states = resnet(hidden_states, temb)
-            hidden_states = attn(hidden_states, context=encoder_hidden_states)
+            hidden_states = attn(hidden_states, context=encoder_hidden_states, ip_adapter_scale=ip_adapter_scale)
             output_states += (hidden_states, )
 
         if self.downsamplers is not None:
@@ -527,6 +618,7 @@ class SpatialTransformer(nn.Module):
         d_head,
         depth=1,
         context_dim=None,
+        cross_attention_dim=768
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -548,7 +640,9 @@ class SpatialTransformer(nn.Module):
             BasicTransformerBlock(inner_dim,
                                   n_heads,
                                   d_head,
-                                  context_dim=context_dim)
+                                  context_dim=context_dim,
+                                  hidden_size=in_channels,
+                                  cross_attention_dim=cross_attention_dim)
             for d in range(depth)
         ])
 
@@ -558,14 +652,14 @@ class SpatialTransformer(nn.Module):
                                   stride=1,
                                   padding=0)
 
-    def forward(self, hidden_states, context=None):
+    def forward(self, hidden_states, context=None, ip_adapter_scale=None):
         batch, channel, height, weight = hidden_states.shape
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         hidden_states = self.proj_in(hidden_states)
         hidden_states = hidden_states.view(batch, channel, 1, height * weight)
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, context=context)
+            hidden_states = block(hidden_states, context=context, ip_adapter_scale=ip_adapter_scale)
         hidden_states = hidden_states.view(batch, channel, height, weight)
         hidden_states = self.proj_out(hidden_states)
         return hidden_states + residual
@@ -573,7 +667,7 @@ class SpatialTransformer(nn.Module):
 
 class BasicTransformerBlock(nn.Module):
 
-    def __init__(self, dim, n_heads, d_head, context_dim=None, gated_ff=True):
+    def __init__(self, dim, n_heads, d_head, context_dim, hidden_size, cross_attention_dim, gated_ff=True):
         super().__init__()
         self.attn1 = CrossAttention(
             query_dim=dim,
@@ -586,15 +680,17 @@ class BasicTransformerBlock(nn.Module):
             context_dim=context_dim,
             heads=n_heads,
             dim_head=d_head,
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim
         )
         self.norm1 = LayerNormANE(dim)
         self.norm2 = LayerNormANE(dim)
         self.norm3 = LayerNormANE(dim)
 
-    def forward(self, hidden_states, context=None):
+    def forward(self, hidden_states, context=None, ip_adapter_scale=None):
         hidden_states = self.attn1(self.norm1(hidden_states)) + hidden_states
         hidden_states = self.attn2(self.norm2(hidden_states),
-                                   context=context) + hidden_states
+                                   context=context, ip_adapter_scale=ip_adapter_scale) + hidden_states
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
         return hidden_states
 
@@ -780,6 +876,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                     in_channels // attn_num_head_channels,
                     depth=transformer_layers_per_block,
                     context_dim=cross_attention_dim,
+                    cross_attention_dim=cross_attention_dim
                 ))
             resnets.append(
                 ResnetBlock2D(
@@ -794,16 +891,16 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None):
+    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, ip_adapter_scale=None):
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
-            hidden_states = attn(hidden_states, encoder_hidden_states)
+            hidden_states = attn(hidden_states, encoder_hidden_states, ip_adapter_scale=ip_adapter_scale)
             hidden_states = resnet(hidden_states, temb)
 
         return hidden_states
 
 
-class UNet2DConditionModel(ModelMixin, ConfigMixin):
+class UNet2DConditionModel(ModelMixin, ConfigMixin, IPAdapterMixin):
 
     @register_to_config
     def __init__(
@@ -838,6 +935,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         addition_time_embed_dim=None,
         projection_class_embeddings_input_dim=None,
         support_controlnet=False,
+        support_image_prompt=False,
+        encoder_hid_proj_reference=None,
         **kwargs,
     ):
         if kwargs.get("dual_cross_attention", None):
@@ -854,6 +953,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
 
         self.config.time_cond_proj_dim = None
         self.support_controlnet = support_controlnet
+        self.support_image_prompt = support_image_prompt
         self.sample_size = sample_size
         time_embed_dim = block_out_channels[0] * 4
 
@@ -872,6 +972,15 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         self.time_proj = time_proj
         self.time_embedding = time_embedding
         self.encoder_hid_proj = None
+
+        if encoder_hid_proj_reference is not None:
+            image_projection_layers = []
+            for image_projection_layer in encoder_hid_proj_reference.image_projection_layers:
+                image_projection_layer = image_projection_layer.float()
+                image_projection_layer._register_load_state_dict_pre_hook(conv2d_to_linear_map)
+                image_projection_layers.append(image_projection_layer)
+
+            self.encoder_hid_proj = MultiIPAdapterImageProjection(image_projection_layers)
 
         if addition_embed_type == "text":
             raise NotImplementedError
@@ -1067,6 +1176,8 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
         encoder_hidden_states,
         time_ids,
         text_embeds,
+        image_embeds,
+        ip_adapter_scale,
         *additional_residuals,
     ):
         # 0. Project time embeddings
@@ -1095,6 +1206,12 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
 
         emb = emb + aug_emb if aug_emb is not None else emb
 
+        # Image prompt
+        if self.support_image_prompt:
+            image_embeds_list = self.encoder_hid_proj(image_embeds)
+            image_embeds_list[0] = image_embeds_list[0].transpose(1, 2).transpose(1, 3)
+            encoder_hidden_states = (encoder_hidden_states, image_embeds_list[0])
+
         # 1. center input if necessary
         if self.config.center_input_sample:
             sample = 2 * sample - 1.0
@@ -1111,7 +1228,8 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
                     temb=emb,
-                    encoder_hidden_states=encoder_hidden_states)
+                    encoder_hidden_states=encoder_hidden_states,
+                    ip_adapter_scale=ip_adapter_scale)
             else:
                 sample, res_samples = downsample_block(hidden_states=sample,
                                                        temb=emb)
@@ -1128,8 +1246,9 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
         # 4. mid
         sample = self.mid_block(sample,
                                 emb,
-                                encoder_hidden_states=encoder_hidden_states)
-        
+                                encoder_hidden_states=encoder_hidden_states,
+                                ip_adapter_scale=ip_adapter_scale)
+
         if self.support_controlnet:
             sample = sample + additional_residuals[-1]
 
@@ -1146,6 +1265,7 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
                     temb=emb,
                     res_hidden_states_tuple=res_samples,
                     encoder_hidden_states=encoder_hidden_states,
+                    ip_adapter_scale=ip_adapter_scale
                 )
             else:
                 sample = upsample_block(hidden_states=sample,
@@ -1158,6 +1278,26 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
         sample = self.conv_out(sample)
 
         return (sample, )
+
+
+class UNet2DConditionModelXLWithoutIPAdapter(nn.Module):
+    """ Wrapper nn.Module wrapper for UNet2DConditionModelXL
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states,
+        time_ids,
+        text_embeds,
+        additional_residuals
+    ):
+        return self.model(sample, timestep, encoder_hidden_states, time_ids, text_embeds, None, 0.0, additional_residuals)
 
 
 def get_down_block(
