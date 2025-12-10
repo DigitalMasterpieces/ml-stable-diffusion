@@ -168,7 +168,7 @@ class IPAdapterAttnProcessor2_0(nn.Module):
 class CrossAttention(nn.Module):
     """ Apple Silicon friendly version of `diffusers.models.attention.CrossAttention`
     """
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, hidden_size=None, cross_attention_dim=None):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, hidden_size=None, cross_attention_dim=None, use_ip_adapter=False):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = context_dim if context_dim is not None else query_dim
@@ -187,7 +187,7 @@ class CrossAttention(nn.Module):
                               kernel_size=1,
                               bias=False)
 
-        if (hidden_size != None and cross_attention_dim != None):
+        if use_ip_adapter and hidden_size != None and cross_attention_dim != None:
             self.processor = IPAdapterAttnProcessor2_0(
                 hidden_size=hidden_size,
                 cross_attention_dim=cross_attention_dim
@@ -263,7 +263,8 @@ class CrossAttnUpBlock2D(nn.Module):
         output_scale_factor=1.0,
         downsample_padding=1,
         add_upsample=True,
-        transformer_layers_per_block=1
+        transformer_layers_per_block=1,
+        use_ip_adapter=False
     ):
         super().__init__()
         resnets = []
@@ -294,6 +295,7 @@ class CrossAttnUpBlock2D(nn.Module):
                     depth=transformer_layers_per_block,
                     context_dim=cross_attention_dim,
                     cross_attention_dim=cross_attention_dim,
+                    use_ip_adapter=use_ip_adapter,
                 ))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
@@ -395,7 +397,8 @@ class CrossAttnDownBlock2D(nn.Module):
         attention_type="default",
         output_scale_factor=1.0,
         downsample_padding=1,
-        add_downsample=True
+        add_downsample=True,
+        use_ip_adapter=False
     ):
         super().__init__()
         resnets = []
@@ -422,7 +425,8 @@ class CrossAttnDownBlock2D(nn.Module):
                     out_channels // attn_num_head_channels,
                     depth=transformer_layers_per_block,
                     context_dim=cross_attention_dim,
-                    cross_attention_dim=cross_attention_dim
+                    cross_attention_dim=cross_attention_dim,
+                    use_ip_adapter=use_ip_adapter,
                 ))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
@@ -618,7 +622,8 @@ class SpatialTransformer(nn.Module):
         d_head,
         depth=1,
         context_dim=None,
-        cross_attention_dim=768
+        cross_attention_dim=768,
+        use_ip_adapter=False
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -642,7 +647,8 @@ class SpatialTransformer(nn.Module):
                                   d_head,
                                   context_dim=context_dim,
                                   hidden_size=in_channels,
-                                  cross_attention_dim=cross_attention_dim)
+                                  cross_attention_dim=cross_attention_dim,
+                                  use_ip_adapter=use_ip_adapter)
             for d in range(depth)
         ])
 
@@ -667,12 +673,13 @@ class SpatialTransformer(nn.Module):
 
 class BasicTransformerBlock(nn.Module):
 
-    def __init__(self, dim, n_heads, d_head, context_dim, hidden_size, cross_attention_dim, gated_ff=True):
+    def __init__(self, dim, n_heads, d_head, context_dim, hidden_size, cross_attention_dim, gated_ff=True, use_ip_adapter=False):
         super().__init__()
         self.attn1 = CrossAttention(
             query_dim=dim,
             heads=n_heads,
             dim_head=d_head,
+            use_ip_adapter=use_ip_adapter,
         )
         self.ff = FeedForward(dim, glu=gated_ff)
         self.attn2 = CrossAttention(
@@ -681,7 +688,8 @@ class BasicTransformerBlock(nn.Module):
             heads=n_heads,
             dim_head=d_head,
             hidden_size=hidden_size,
-            cross_attention_dim=cross_attention_dim
+            cross_attention_dim=cross_attention_dim,
+            use_ip_adapter=use_ip_adapter,
         )
         self.norm1 = LayerNormANE(dim)
         self.norm2 = LayerNormANE(dim)
@@ -847,6 +855,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         attention_type="default",
         cross_attention_dim=768,
         transformer_layers_per_block=1,
+        use_ip_adapter=False,
         **kwargs,
     ):
         super().__init__()
@@ -876,7 +885,8 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                     in_channels // attn_num_head_channels,
                     depth=transformer_layers_per_block,
                     context_dim=cross_attention_dim,
-                    cross_attention_dim=cross_attention_dim
+                    cross_attention_dim=cross_attention_dim,
+                    use_ip_adapter=use_ip_adapter,
                 ))
             resnets.append(
                 ResnetBlock2D(
@@ -1029,6 +1039,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, IPAdapterMixin):
                 attn_num_head_channels=attention_head_dim[i],
                 downsample_padding=downsample_padding,
                 add_downsample=not is_final_block,
+                use_ip_adapter=support_image_prompt,
             )
             self.down_blocks.append(down_block)
 
@@ -1045,6 +1056,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, IPAdapterMixin):
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attention_head_dim[i],
             resnet_groups=norm_num_groups,
+            use_ip_adapter=support_image_prompt,
         )
 
         # up
@@ -1075,6 +1087,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, IPAdapterMixin):
                 resnet_act_fn=act_fn,
                 cross_attention_dim=cross_attention_dim,
                 attn_num_head_channels=reversed_attention_head_dim[i],
+                use_ip_adapter=support_image_prompt,
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
@@ -1314,6 +1327,7 @@ def get_down_block(
     cross_attention_dim=None,
     downsample_padding=None,
     add_downsample=True,
+    use_ip_adapter=False,
 ):
     down_block_type = down_block_type[7:] if down_block_type.startswith(
         "UNetRes") else down_block_type
@@ -1346,6 +1360,7 @@ def get_down_block(
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
             add_downsample=add_downsample,
+            use_ip_adapter=use_ip_adapter,
         )
 
 
@@ -1362,6 +1377,7 @@ def get_up_block(
     attn_num_head_channels,
     transformer_layers_per_block=1,
     cross_attention_dim=None,
+    use_ip_adapter=False,
 ):
     up_block_type = up_block_type[7:] if up_block_type.startswith(
         "UNetRes") else up_block_type
@@ -1392,6 +1408,7 @@ def get_up_block(
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
             transformer_layers_per_block=transformer_layers_per_block,
+            use_ip_adapter=use_ip_adapter,
         )
     raise ValueError(f"{up_block_type} does not exist.")
 

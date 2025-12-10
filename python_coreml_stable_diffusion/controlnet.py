@@ -163,6 +163,7 @@ class ControlNetModel(ModelMixin, ConfigMixin):
                 attn_num_head_channels=attention_head_dim[i],
                 downsample_padding=downsample_padding,
                 add_downsample=not is_final_block,
+                use_ip_adapter=False,
             )
             self.down_blocks.append(down_block)
 
@@ -193,6 +194,7 @@ class ControlNetModel(ModelMixin, ConfigMixin):
             use_linear_projection=use_linear_projection,
             upcast_attention=upcast_attention,
             transformer_layers_per_block=transformer_layers_per_block[-1],
+            use_ip_adapter=False,
         )
 
     def get_num_residuals(self):

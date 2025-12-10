@@ -417,6 +417,7 @@ class ControlNetUnionModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 attn_num_head_channels=attention_head_dim[i],
                 #attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
                 downsample_padding=downsample_padding,
+                use_ip_adapter=False,
                 #use_linear_projection=use_linear_projection,
                 #only_cross_attention=only_cross_attention[i],
                 #upcast_attention=upcast_attention,
@@ -451,6 +452,7 @@ class ControlNetUnionModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             resnet_groups=norm_num_groups,
             use_linear_projection=use_linear_projection,
             upcast_attention=upcast_attention,
+            use_ip_adapter=False,
         )
 
     def get_num_residuals(self):
