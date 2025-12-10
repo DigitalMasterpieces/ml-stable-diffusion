@@ -8,8 +8,11 @@ from python_coreml_stable_diffusion import (
     unet, controlnet, controlnetunion, chunk_mlprogram
 )
 
+from python_coreml_stable_diffusion.unet import AttnProcessor2_0, IPAdapterAttnProcessor2_0
+
 import argparse
 from collections import OrderedDict, defaultdict
+from typing import Dict
 from copy import deepcopy
 import coremltools as ct
 from diffusers import (
@@ -23,7 +26,7 @@ from diffusionkit.tests.torch2coreml import (
     convert_vae_to_mlpackage
 )
 import gc
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, hf_hub_download
 
 import logging
 
@@ -38,12 +41,16 @@ import shutil
 import time
 import re
 import pathlib
+import json
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
 
 torch.set_grad_enabled(False)
+
+from transformers import CLIPVisionModel, CLIPVisionModelWithProjection
 
 from types import MethodType
 
@@ -184,7 +191,7 @@ def _get_deployment_target(target_string):
 def quantize_weights(args):
     """ Quantize weights to args.quantize_nbits using a palette (look-up table)
     """
-    for model_name in ["text_encoder", "text_encoder_2", "unet", "refiner", "control-unet"]:
+    for model_name in ["text_encoder", "text_encoder_2", "image_encoder", "unet", "refiner", "control-unet"]:
         logger.info(f"Quantizing {model_name} to {args.quantize_nbits}-bit precision")
         out_path = _get_out_path(args, model_name)
         _quantize_weights(
@@ -283,18 +290,25 @@ def bundle_resources_for_swift_cli(args):
     # Compile model using coremlcompiler (Significantly reduces the load time for unet)
     for source_name, target_name in [("text_encoder", "TextEncoder"),
                                      ("text_encoder_2", "TextEncoder2"),
+                                     ("image_encoder", "ImageEncoder"),
                                      ("vae_decoder", "VAEDecoder"),
                                      ("vae_encoder", "VAEEncoder"),
                                      ("unet", "Unet"),
                                      ("unet_chunk1", "UnetChunk1"),
                                      ("unet_chunk2", "UnetChunk2"),
+                                     ("unet_chunk3", "UnetChunk3"),
+                                     ("unet_chunk4", "UnetChunk4"),
                                      ("refiner", "UnetRefiner"),
                                      ("refiner_chunk1", "UnetRefinerChunk1"),
                                      ("refiner_chunk2", "UnetRefinerChunk2"),
+                                     ("refiner_chunk3", "UnetRefinerChunk3"),
+                                     ("refiner_chunk4", "UnetRefinerChunk4"),
                                      ("mmdit", "MultiModalDiffusionTransformer"),
                                      ("control-unet", "ControlledUnet"),
                                      ("control-unet_chunk1", "ControlledUnetChunk1"),
                                      ("control-unet_chunk2", "ControlledUnetChunk2"),
+                                     ("control-unet_chunk3", "ControlledUnetChunk3"),
+                                     ("control-unet_chunk4", "ControlledUnetChunk4"),
                                      ("safety_checker", "SafetyChecker")]:
         source_path = _get_out_path(args, source_name)
         if os.path.exists(source_path):
@@ -377,6 +391,214 @@ def patched_make_causal_mask(input_ids_shape, dtype, device, past_key_values_len
     
 modeling_clip._make_causal_mask = patched_make_causal_mask # For transformers >= 4.30.0 and transformers < 4.35.0
 modeling_clip._create_4d_causal_attention_mask = patched_make_causal_mask # For transformers >= 4.35.0
+
+def _load_image_encoder(model_spec: str):
+    """
+    Load CLIP image encoder from a model with optional subfolder.
+    model_spec: "model_name[:subfolder]"
+    """
+    if ":" in model_spec:
+        model_name, subfolder = model_spec.split(":", 1)
+    else:
+        model_name, subfolder = model_spec, None
+
+    model_name = model_name.strip()
+    subfolder = subfolder.strip() if subfolder else None
+
+    try:
+        image_encoder = CLIPVisionModel.from_pretrained(
+            model_name,
+            subfolder=subfolder,
+            torch_dtype=torch.float16
+        )
+    except Exception as e:
+        logger.info(f"❌ Failed to load {model_name} (subfolder={subfolder}): {e}")
+        return None
+
+    logger.info(f"✅ Loaded image encoder '{model_name}' (subfolder={subfolder})")
+    return image_encoder
+
+def _load_ip_adapter(model_spec: str, pipe):
+    """
+    Load IP adapter from a model with optional subfolder.
+    model_spec: "model_name[:subfolder]"
+    """
+    if ":" in model_spec:
+        model_name, subfolder, weight_name = model_spec.split(":", 2)
+    else:
+        model_name, subfolder, weight_name = model_spec, None, None
+
+    model_name = model_name.strip()
+    subfolder = subfolder.strip() if subfolder else ""
+    weight_name = weight_name.strip() if weight_name else None
+
+    try:
+        pipe.load_ip_adapter(model_name, subfolder=subfolder, weight_name=weight_name)
+    except Exception as e:
+        logger.info(f"❌ Failed to load {model_name} (subfolder={subfolder}) (weight_name={weight_name}): {e}")
+        return None
+
+    logger.info(f"✅ Loaded IP adapter '{model_name}' (subfolder={subfolder}) (weight_name={weight_name})")
+    return
+
+
+def _determine_image_encoder_output_mode(image_encoder):
+    config = image_encoder.config
+
+    # Default assumption
+    mode = "hidden_states"
+
+    # 1️⃣ Class check
+    if isinstance(image_encoder, CLIPVisionModelWithProjection):
+        has_projection = config.projection_dim is not None
+        different_dims = (
+            has_projection and config.projection_dim != config.hidden_size
+        )
+
+        # If projection exists and it's intended to be used (same as hidden_size)
+        # → projection is internal, so use .image_embeds
+        if has_projection and not different_dims:
+            mode = "image_embeds"
+        # Otherwise, external projection → hidden_states
+        else:
+            mode = "hidden_states"
+
+    elif isinstance(image_encoder, CLIPVisionModel):
+        # Pure vision encoder → definitely hidden_states
+        mode = "hidden_states"
+
+    return mode
+
+def convert_image_encoder(image_encoder, submodule_name, args):
+    """ Converts image encoder for Stable Diffusion
+    """
+    if image_encoder is None:
+        logger.info(f"❌ Failed to convert image encoder, no image encoder defined.")
+        return
+
+    image_encoder = image_encoder.to(dtype=torch.float32)
+
+    out_path = _get_out_path(args, submodule_name)
+
+    if os.path.exists(out_path):
+        logger.info(
+            f"`ImageEncoder` already exists at {out_path}, skipping conversion."
+        )
+        return
+
+    sample_shape = (
+        1,     # B
+        image_encoder.config.num_channels, # C
+        image_encoder.config.image_size,   # H
+        image_encoder.config.image_size,   # W
+    )
+
+    sample_image_encoder_inputs = {
+        "input_image":
+        torch.rand(*sample_shape, dtype=torch.float16)
+    }
+    sample_image_encoder_inputs_spec = {
+        k: (v.shape, v.dtype)
+        for k, v in sample_image_encoder_inputs.items()
+    }
+    logger.info(f"Sample inputs spec: {sample_image_encoder_inputs_spec}")
+
+    class ImageEncoder(nn.Module):
+
+        def __init__(self, mode):
+            super().__init__()
+            self.image_encoder = image_encoder
+            self.mode = mode
+            # CLIP normalization
+            _means = [0.48145466, 0.4578275, 0.40821073]
+            _stds = [0.26862954, 0.26130258, 0.27577711]
+
+            self.stds = torch.tensor(_stds).to(torch.float32)[:,None,None]
+            self.means = torch.tensor(_means).to(torch.float32)[:,None,None]
+
+            self.transform_model = torch.nn.Sequential(
+                transforms.Normalize(mean=_means,
+                std=_stds)
+            )
+
+        def forward(self, input_image):
+            input_image_normalized = self.transform_model(input_image)
+
+            if mode == "hidden_states":
+                image_embeds = self.image_encoder(input_image_normalized, output_hidden_states=True).hidden_states[-2]
+            else:
+                image_embeds = self.image_encoder(input_image_normalized, output_hidden_states=False).image_embeds
+
+            negative_image_embeds = torch.zeros_like(image_embeds)
+
+            do_classifier_free_guidance = True
+
+            if mode == "hidden_states":
+                if do_classifier_free_guidance:
+                    return torch.cat([image_embeds, image_embeds], dim=0)
+                else:
+                    return image_embeds
+            else:
+                image_embeds = image_embeds[None, :]
+                negative_image_embeds = negative_image_embeds[None, :]
+                if do_classifier_free_guidance:
+                    return torch.cat([image_embeds, image_embeds], dim=0)
+                else:
+                    return image_embeds
+
+    mode = _determine_image_encoder_output_mode(image_encoder)
+
+    hidden_layer = None
+    reference_image_encoder = ImageEncoder(mode).eval()
+
+    logger.info(f"JIT tracing..")
+    reference_image_encoder = torch.jit.trace(
+        reference_image_encoder,
+        (sample_image_encoder_inputs["input_image"].to(torch.float32), ),
+    )
+    logger.info("Done.")
+
+    output_names = ["image_embeds"]
+    coreml_image_encoder, out_path = _convert_to_coreml(
+        f"imageencoder",
+        reference_image_encoder, sample_image_encoder_inputs,
+        output_names, args, out_path=out_path, precision=ct.precision.FLOAT16)
+
+    # Set model metadata
+    coreml_image_encoder.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
+    coreml_image_encoder.license = "MIT License"
+    coreml_image_encoder.version = args.model_version
+    coreml_image_encoder.short_description = \
+        "The CLIP model was developed by researchers at OpenAI to learn about what contributes to robustness in computer vision tasks."
+
+    # Set the input descriptions
+    coreml_image_encoder.input_description["input_image"] = "The input image"
+
+    # Set the output descriptions
+    coreml_image_encoder.output_description["image_embeds"] = "Image Embeds"
+
+    coreml_image_encoder.save(out_path)
+
+    logger.info(f"Saved image_encoder into {out_path}")
+
+    # Parity check PyTorch vs CoreML
+    if args.check_output_correctness:
+        with torch.no_grad():
+            baseline_out = reference_image_encoder(sample_image_encoder_inputs["input_image"].to(torch.float32))
+
+        baseline_out = baseline_out.numpy()
+
+        coreml_out = coreml_image_encoder.predict(
+            {k: v.numpy() for k, v in sample_image_encoder_inputs.items()}
+        )
+        coreml_out = coreml_out["image_embeds"]
+        report_correctness(
+            baseline_out, coreml_out,
+            "image_encoder baseline PyTorch to reference CoreML")
+
+    del reference_image_encoder, coreml_image_encoder
+    gc.collect()
+
 
 def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
     """ Converts the text encoder component of Stable Diffusion
@@ -724,7 +946,7 @@ def convert_vae_encoder(pipe, args):
         width,  # w
     )
 
-    if args.xl_version:
+    if args.custom_vae_version is None and args.xl_version:
         inputs_dtype = torch.float32
         compute_precision = ct.precision.FLOAT32
         # FIXME: Hardcoding to CPU_AND_GPU since ANE doesn't support FLOAT32
@@ -797,6 +1019,39 @@ def convert_vae_encoder(pipe, args):
     del traced_vae_encoder, pipe.vae.encoder, coreml_vae_encoder
     gc.collect()
 
+def _attn_processors(unet_cls) -> Dict[str, nn.Module]:
+    r"""
+    Returns:
+        `dict` of attention processors: A dictionary containing all attention processors used in the model with
+        indexed by its weight name.
+    """
+    # set recursively
+    processors = {}
+
+    def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, nn.Module]):
+        if hasattr(module, "get_processor"):
+            processors[f"{name}.processor"] = module.get_processor()
+
+        for sub_name, child in module.named_children():
+            fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
+
+        return processors
+
+    for name, module in unet_cls.named_children():
+        fn_recursive_add_processors(name, module, processors)
+
+    return processors
+
+def _set_ip_adapter_additional_scales(unet_cls, ip_scales):
+    for attn_name, attn_processor in _attn_processors(unet_cls).items():
+        if isinstance(
+            attn_processor, (IPAdapterAttnProcessor2_0)
+        ):
+            for i, scale in enumerate(ip_scales):
+                for k, s in scale.items():
+                    if attn_name.startswith(k):
+                        logger.info(f"Setting processor additional scale of {attn_name} to value {s}")
+                        attn_processor.ip_adapter_scale_additional = torch.tensor([s])
 
 def convert_unet(pipe, args, model_name=None):
     """ Converts the UNet component of Stable Diffusion
@@ -809,12 +1064,13 @@ def convert_unet(pipe, args, model_name=None):
     out_path = _get_out_path(args, unet_name)
 
     # Check if Unet was previously exported and then chunked
-    unet_chunks_exist = all(
-        os.path.exists(
-            out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
-        for idx in range(2))
+    if args.unet_chunks is not None:
+        unet_chunks_exist = all(
+            os.path.exists(
+                out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
+            for idx in range(args.unet_chunks))
 
-    if args.chunk_unet and unet_chunks_exist:
+    if args.unet_chunks is not None and unet_chunks_exist:
         logger.info("`unet` chunks already exist, skipping conversion.")
         del pipe.unet
         gc.collect()
@@ -911,10 +1167,43 @@ def convert_unet(pipe, args, model_name=None):
 
             sample_unet_inputs.update(additional_xl_inputs)
             baseline_sample_unet_inputs['added_cond_kwargs'] = additional_xl_inputs
+
+            if pipe.image_encoder is not None:
+                image_enc_cfg = pipe.image_encoder.config
+                mode = _determine_image_encoder_output_mode(pipe.image_encoder)
+
+                if mode == "hidden_states":
+                    H, W = image_enc_cfg.image_size, image_enc_cfg.image_size
+                    P = image_enc_cfg.patch_size
+                    D = image_enc_cfg.hidden_size
+                    num_patches = (H // P) * (W // P)
+                    image_embeds_shape = (batch_size, num_patches + 1, D)
+                else:
+                    image_embeds_shape = (batch_size, 1, image_enc_cfg.projection_dim)
+
+                additional_xl_inputs["image_embeds"] = torch.rand(*image_embeds_shape)
+                additional_xl_inputs["ip_adapter_scale"] = torch.tensor([1.0])
+                sample_unet_inputs.update(additional_xl_inputs)
+                baseline_sample_unet_inputs['added_cond_kwargs'] = additional_xl_inputs
+            else:
+                sample_unet_inputs.update(additional_xl_inputs)
         else:
             unet_cls = unet.UNet2DConditionModel
 
-        reference_unet = unet_cls(support_controlnet=args.unet_support_controlnet, **pipe.unet.config).eval()
+        reference_unet = unet_cls(support_controlnet=args.unet_support_controlnet, support_image_prompt=(pipe.image_encoder is not None), encoder_hid_proj_reference=pipe.unet.encoder_hid_proj, **pipe.unet.config).eval()
+
+        # Hook in additional scales for the IP-Adapter
+        if args.load_ip_adapter:
+            try:
+                ip_scales = json.loads(args.ip_scales)
+            except json.JSONDecodeError:
+                raise ValueError("Invalid JSON passed to --ip_scales")
+
+            # Normalize: always a list of dicts
+            if isinstance(ip_scales, dict):
+                ip_scales = [ip_scales]
+
+            _set_ip_adapter_additional_scales(reference_unet, ip_scales)
 
         load_state_dict_summary = reference_unet.load_state_dict(
             pipe.unet.state_dict())
@@ -965,8 +1254,11 @@ def convert_unet(pipe, args, model_name=None):
 
         # JIT trace
         logger.info("JIT tracing..")
-        reference_unet = torch.jit.trace(reference_unet,
-                                         list(sample_unet_inputs.values()))
+        if pipe.image_encoder is not None:
+            reference_unet = torch.jit.trace(reference_unet, list(sample_unet_inputs.values()))
+        else:
+            reference_unet = UNet2DConditionModelXLWithoutIPAdapter(reference_unet)
+            reference_unet = torch.jit.trace(reference_unet, list(sample_unet_inputs.values()))
         logger.info("Done.")
 
         if args.check_output_correctness:
@@ -983,7 +1275,6 @@ def convert_unet(pipe, args, model_name=None):
             k: v.numpy().astype(np.float16)
             for k, v in sample_unet_inputs.items()
         }
-
 
         coreml_unet, out_path = _convert_to_coreml(unet_name, reference_unet,
                                                    coreml_sample_unet_inputs,
@@ -1017,6 +1308,12 @@ def convert_unet(pipe, args, model_name=None):
             coreml_unet.input_description["text_embeds"] = \
                 "Additional embeddings from text_encoder_2 that if specified are added to the embeddings that are passed along to the UNet blocks."
 
+            if pipe.image_encoder is not None:
+                coreml_unet.input_description["image_embeds"] = \
+                "Additional embeddings from image_encoder that if specified are added to the embeddings that are passed along to the UNet blocks."
+                coreml_unet.input_description["ip_adapter_scale"] = \
+                "Weight of the additional embeddings from image_encoder when used in attention processors."
+
         # Set the output descriptions
         coreml_unet.output_description["noise_pred"] = \
             "Same shape and dtype as the `sample` input. " \
@@ -1044,13 +1341,76 @@ def convert_unet(pipe, args, model_name=None):
         logger.info(
             f"`unet` already exists at {out_path}, skipping conversion.")
 
-    if args.chunk_unet and not unet_chunks_exist:
-        logger.info(f"Chunking {model_name} in two approximately equal MLModels")
+def chunk_unet(pipe, args, model_name=None):
+    """ Chunks the UNet component of Stable Diffusion
+    """
+    if args.unet_support_controlnet:
+        unet_name = "control-unet"
+    else:
+        unet_name = model_name or "unet"
+
+    out_path = _get_out_path(args, unet_name)
+
+    # Check if Unet was previously exported and then chunked
+    if args.unet_chunks is not None:
+        unet_chunks_exist = all(
+            os.path.exists(
+                out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
+            for idx in range(args.unet_chunks))
+
+    if args.unet_chunks is not None and unet_chunks_exist:
+        return
+
+    if args.unet_chunks is not None and not unet_chunks_exist:
+        logger.info(f"Chunking {unet_name} in {args.unet_chunks} approximately equal MLModels")
         args.mlpackage_path = out_path
         args.remove_original = False
         args.merge_chunks_in_pipeline_model = False
         chunk_mlprogram.main(args)
 
+        if args.unet_chunks == 4:
+            chunk_dir = os.path.dirname(out_path)
+            base = os.path.basename(out_path).replace(".mlpackage", "")
+
+            first_chunks = [
+                os.path.join(chunk_dir, f)
+                for f in os.listdir(chunk_dir)
+                if f.startswith(base + "_chunk") and f.endswith(".mlpackage")
+            ]
+
+            for c in first_chunks:
+                logger.info(f"Chunking sub-chunk: {c}")
+                args.mlpackage_path = c
+                chunk_mlprogram.main(args)
+
+            # Delete first-pass chunks
+            for f in [f"{base}_chunk1.mlpackage", f"{base}_chunk2.mlpackage"]:
+                path = os.path.join(chunk_dir, f)
+                if os.path.exists(path):
+                    shutil.rmtree(path)
+                    logger.info(f"Deleted first-pass chunk: {path}")
+
+            # Rename second-level chunks
+            rename_map = {
+                f"{base}_chunk1_chunk1.mlpackage": f"{base}_chunk1.mlpackage",
+                f"{base}_chunk1_chunk2.mlpackage": f"{base}_chunk2.mlpackage",
+                f"{base}_chunk2_chunk1.mlpackage": f"{base}_chunk3.mlpackage",
+                f"{base}_chunk2_chunk2.mlpackage": f"{base}_chunk4.mlpackage",
+            }
+
+            for src_name, dst_name in rename_map.items():
+                src_path = os.path.join(chunk_dir, src_name)
+                dst_path = os.path.join(chunk_dir, dst_name)
+                if os.path.exists(dst_path):
+                    shutil.rmtree(dst_path)
+                os.rename(src_path, dst_path)
+                logger.info(f"Renamed {src_path} -> {dst_path}")
+
+            # Delete original unet
+            if os.path.exists(out_path):
+                shutil.rmtree(out_path)
+
+            logger.info(f"Finished chunking unet")
 
 def convert_mmdit(args):
     """ Converts the MMDiT component of Stable Diffusion 3
@@ -1316,18 +1676,30 @@ def _get_controlnet_base_model(controlnet_model_version):
     info = model_info(controlnet_model_version)
     return info.cardData.get("base_model", None)
 
+def _is_union_controlnet(controlnet_model_version):
+    # Download only the config
+    config_path = hf_hub_download(controlnet_model_version, "config.json")
+
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    # Union models include num_control_types (or num_control_type)
+    n = cfg.get("num_control_types") or cfg.get("num_control_type")
+
+    return n is not None and n > 1, n
+
 def convert_controlnet(pipe, args):
     """ Converts each ControlNet for Stable Diffusion
     """
     if not hasattr(pipe, "unet"):
         raise RuntimeError(
             "convert_unet() deletes pipe.unet to save RAM. "
-            "Please use convert_vae_encoder() before convert_unet()")
+            "Please use convert_controlnet() before convert_unet()")
 
     if not hasattr(pipe, "text_encoder"):
             raise RuntimeError(
                 "convert_text_encoder() deletes pipe.text_encoder to save RAM. "
-                "Please use convert_unet() before convert_text_encoder()")
+                "Please use convert_controlnet() before convert_text_encoder()")
 
     for i, controlnet_model_version in enumerate(args.convert_controlnet):
         base_model = _get_controlnet_base_model(controlnet_model_version)
@@ -1336,12 +1708,13 @@ def convert_controlnet(pipe, args):
             logger.warning(
                 f"The original ControlNet models were trained using Stable Diffusion v1.5. "
                 f"It is possible that model {args.model_version} is not compatible with controlnet.")
-        if base_model is not None and base_model != args.model_version:
-            raise RuntimeError(
-                f"ControlNet model {controlnet_model_version} was trained using "
-                f"Stable Diffusion model {base_model}.\n However, you specified "
-                f"version {args.model_version} in the command line. Please, use "
-                f"--model-version {base_model} to convert this model.")
+        # FIXME: This check does not seem to work with certain ControlNets for SDXL 1.0
+        #if base_model is not None and base_model != args.model_version:
+        #    raise RuntimeError(
+        #        f"ControlNet model {controlnet_model_version} was trained using "
+        #        f"Stable Diffusion model {base_model}.\n However, you specified "
+        #        f"version {args.model_version} in the command line. Please, use "
+        #        f"--model-version {base_model} to convert this model.")
 
         controlnet_model_name = controlnet_model_version.replace("/", "_")
         fname = f"ControlNet_{controlnet_model_name}.mlpackage"
@@ -1353,8 +1726,12 @@ def convert_controlnet(pipe, args):
             )
             continue
 
+        is_union, _ = _is_union_controlnet(controlnet_model_version)
+        if is_union:
+            logger.info(f"{controlnet_model_version}` will be handled as Union controlnet.")
+
         # Import controlnet model and initialize reference controlnet
-        if args.union_controlnet:
+        if is_union:
             original_controlnet = ControlNetUnionModel.from_pretrained(
                 controlnet_model_version,
                 use_auth_token=True
@@ -1371,7 +1748,7 @@ def convert_controlnet(pipe, args):
 
         load_state_dict_summary = reference_controlnet.load_state_dict(original_controlnet.state_dict())
 
-        if i == 0:
+        if True: # i == 0:
             batch_size = 2  # for classifier-free guidance
             sample_shape = (
                 batch_size,                    # B
@@ -1380,20 +1757,12 @@ def convert_controlnet(pipe, args):
                 (args.latent_w or pipe.unet.config.sample_size),  # W
             )
 
-            if args.union_controlnet:
-                encoder_hidden_states_shape = (
-                    batch_size,
-                    reference_controlnet.config.cross_attention_dim or args.text_encoder_hidden_size or pipe.text_encoder.config.hidden_size,
-                    1,
-                    args.text_token_sequence_length or pipe.text_encoder.config.max_position_embeddings,
-                )
-            else:
-                encoder_hidden_states_shape = (
-                    batch_size,
-                    reference_controlnet.config.cross_attention_dim or args.text_encoder_hidden_size or pipe.text_encoder.config.hidden_size,
-                    1,
-                    args.text_token_sequence_length or pipe.text_encoder.config.max_position_embeddings,
-                )
+            encoder_hidden_states_shape = (
+                batch_size,
+                reference_controlnet.config.cross_attention_dim or args.text_encoder_hidden_size or pipe.text_encoder.config.hidden_size,
+                1,
+                args.text_token_sequence_length or pipe.text_encoder.config.max_position_embeddings,
+            )
 
             controlnet_cond_shape = (
                 batch_size,                                           # B
@@ -1416,7 +1785,7 @@ def convert_controlnet(pipe, args):
             ])
 
             # Setup inputs
-            if args.union_controlnet:
+            if is_union:
                 num_control_type = reference_controlnet.config.num_control_type
                 for i in range(num_control_type):
                     sample_controlnet_inputs['controlnet_cond_' + str(i)] = torch.rand(*controlnet_cond_shape)
@@ -1489,7 +1858,7 @@ def convert_controlnet(pipe, args):
         gc.collect()
 
         # Make inputs optional (for Union ControlNets)
-        if args.union_controlnet:
+        if is_union:
             spec = coreml_controlnet.get_spec()
 
             # Loop over all inputs in the model description
@@ -1516,7 +1885,7 @@ def convert_controlnet(pipe, args):
             "Output embeddings from the associated text_encoder model to condition to generated image on text. " \
             "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. " \
             "Shorter text does not reduce computation."
-        if args.union_controlnet:
+        if is_union:
             for i in range(num_control_type):
                 coreml_controlnet.input_description["controlnet_cond_" + str(i)] = \
                 "An additional input image for ControlNet to condition the generated images."
@@ -1585,6 +1954,15 @@ def main(args):
     # Instantiate diffusers pipe as reference
     pipe = get_pipeline(args)
 
+    # Load Image Encoder
+    if args.load_image_encoder:
+        image_encoder = _load_image_encoder(args.load_image_encoder)
+        pipe.image_encoder = image_encoder
+
+    # Load IP Adapter
+    if args.load_ip_adapter:
+        _load_ip_adapter(args.load_ip_adapter, pipe)
+
     # Register the selected attention implementation globally
     unet.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet.AttentionImplementations[
         args.attention_implementation]
@@ -1628,6 +2006,11 @@ def main(args):
         del pipe.text_encoder_2
         logger.info("Converted text_encoder_2")
 
+    if args.convert_image_encoder:
+        logger.info("Converting image_encoder")
+        convert_image_encoder(pipe.image_encoder, "image_encoder", args)
+        logger.info("Converted image_encoder")
+
     if args.convert_safety_checker:
         logger.info("Converting safety_checker")
         convert_safety_checker(pipe, args)
@@ -1656,6 +2039,11 @@ def main(args):
         quantize_weights(args)
         logger.info(f"Quantized weights to {args.quantize_nbits}-bit precision")
 
+    if args.unet_chunks is not None:
+        logger.info("Chunking unet")
+        chunk_unet(pipe, args)
+        logger.info("Chunking unet")
+
     if args.bundle_resources_for_swift_cli:
         logger.info("Bundling resources for the Swift CLI")
         bundle_resources_for_swift_cli(args)
@@ -1677,8 +2065,30 @@ def parser_spec():
         nargs="*", 
         type=str,
         help=
-        "Converts a ControlNet model hosted on HuggingFace to coreML format. " \
+        "Converts a ControlNet model hosted on HuggingFace to CoreML format. " \
         "To convert multiple models, provide their names separated by spaces.",
+    )
+    parser.add_argument("--convert-image-encoder", action="store_true")
+    parser.add_argument(
+        "--load-image-encoder",
+        type=str,
+        default="",
+        help=
+        "Specific loading of image encoder: model_name[:subfolder] to load and use." \
+        "If not defined, the default image encoder from the pipeline is used."
+    )
+    parser.add_argument(
+        "--load-ip-adapter",
+        type=str,
+        default="",
+        help=
+        "Specific loading of an IP adapter: model_name[:subfolder] to load and use."
+    )
+    parser.add_argument(
+        "--ip-scales",
+        type=str,
+        default="[]",
+        help="JSON list/dict of IP-Adapter additional scales."
     )
     parser.add_argument(
         "--model-version",
@@ -1764,6 +2174,15 @@ def parser_spec():
         "This is required for ANE deployment on iOS and iPadOS. Not required for macOS."
         )
     parser.add_argument(
+        "--unet-chunks",
+        default=None,
+        choices=(2, 4),
+        type=int,
+        help=
+        "If specified, generates mlpackages out of the unet model which approximately equal weights sizes."
+        "This is required for ANE deployment on iOS and iPadOS. Not required for macOS."
+        )
+    parser.add_argument(
         "--quantize-nbits",
         default=None,
         choices=(1, 2, 4, 6, 8),
@@ -1838,11 +2257,6 @@ def parser_spec():
         "--sd3-version",
         action="store_true",
         help=("If specified, the pre-trained model will be treated as an SD3 model."))
-    parser.add_argument(
-        "--union-controlnet",
-        action="store_true",
-        help=("If specified, the control net model will be treated as an instantiation of "
-        "`diffusers.models.controlnet.ControlNetUnionModel` instead of `diffusers.models.controlnet.ControlNetModel`"))
 
     return parser
 
