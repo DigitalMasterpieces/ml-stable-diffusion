@@ -8,7 +8,7 @@ from python_coreml_stable_diffusion import (
     unet, controlnet, controlnetunion, chunk_mlprogram
 )
 
-from python_coreml_stable_diffusion.unet import AttnProcessor2_0, IPAdapterAttnProcessor2_0
+from python_coreml_stable_diffusion.unet import AttnProcessor2_0, IPAdapterAttnProcessor2_0, UNet2DConditionModelXLWithoutIPAdapter
 
 import argparse
 from collections import OrderedDict, defaultdict

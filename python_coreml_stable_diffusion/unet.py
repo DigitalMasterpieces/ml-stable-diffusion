@@ -1308,9 +1308,9 @@ class UNet2DConditionModelXLWithoutIPAdapter(nn.Module):
         encoder_hidden_states,
         time_ids,
         text_embeds,
-        additional_residuals
+        *additional_residuals
     ):
-        return self.model(sample, timestep, encoder_hidden_states, time_ids, text_embeds, None, 0.0, additional_residuals)
+        return self.model(sample, timestep, encoder_hidden_states, time_ids, text_embeds, None, 0.0, *additional_residuals)
 
 
 def get_down_block(
