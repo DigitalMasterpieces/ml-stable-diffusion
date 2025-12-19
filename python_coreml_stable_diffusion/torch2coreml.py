@@ -1149,10 +1149,15 @@ def convert_unet(pipe, args, model_name=None):
                 add_time_ids = list(original_size + crops_coords_top_left + target_size)
                 add_neg_time_ids = list(original_size + crops_coords_top_left + target_size)
 
-            time_ids = [
-                add_neg_time_ids,
-                add_time_ids
-            ]
+            if args.unet_batch_one:
+                time_ids = [
+                    add_time_ids
+                ]
+            else: # for classifier-free guidance
+                time_ids = [
+                    add_neg_time_ids,
+                    add_time_ids
+                ]
 
             # Pooled text embedding from text_encoder_2
             text_embeds_shape = (
@@ -1282,6 +1287,18 @@ def convert_unet(pipe, args, model_name=None):
         del reference_unet
         gc.collect()
 
+        # Make image prompt input optional (if defined)
+        if args.xl_version and pipe.image_encoder is not None:
+            spec = coreml_unet.get_spec()
+
+            # Loop over all inputs in the model description
+            for input_type in spec.description.input:
+                if input_type.name == "image_embeds":
+                    input_type.type.isOptional = True
+
+            # Update model
+            coreml_unet = ct.models.MLModel(spec, weights_dir=coreml_unet.weights_dir)
+
         # Set model metadata
         coreml_unet.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
         if args.xl_version:
@@ -1340,6 +1357,25 @@ def convert_unet(pipe, args, model_name=None):
         gc.collect()
         logger.info(
             f"`unet` already exists at {out_path}, skipping conversion.")
+
+def fix_optional_inputs(mlpackage_path, optional_input_names):
+    """
+    Re-mark specific inputs as optional in a CoreML mlpackage.
+    """
+    model = ct.models.MLModel(mlpackage_path)
+    spec = model.get_spec()
+
+    changed = False
+    for input_type in spec.description.input:
+        if input_type.name in optional_input_names:
+            input_type.type.isOptional = True
+            changed = True
+
+    if changed:
+        ct.models.MLModel(spec, weights_dir=model.weights_dir).save(mlpackage_path)
+        logger.info(f"Patched optional inputs in {mlpackage_path}")
+    else:
+        logger.info(f"No optional inputs to patch in {mlpackage_path}")
 
 def chunk_unet(pipe, args, model_name=None):
     """ Chunks the UNet component of Stable Diffusion
@@ -1405,6 +1441,11 @@ def chunk_unet(pipe, args, model_name=None):
                     shutil.rmtree(dst_path)
                 os.rename(src_path, dst_path)
                 logger.info(f"Renamed {src_path} -> {dst_path}")
+                # Fix: After chunking, the optional input flags are lost. So let's make the image prompt input optional again (if defined)
+                fix_optional_inputs(
+                    dst_path,
+                    optional_input_names={"image_embeds"},
+                )
 
             # Delete original unet
             if os.path.exists(out_path):
@@ -1750,6 +1791,8 @@ def convert_controlnet(pipe, args):
 
         if True: # i == 0:
             batch_size = 2  # for classifier-free guidance
+            if args.unet_batch_one:
+                batch_size = 1  # for not using classifier-free guidance
             sample_shape = (
                 batch_size,                    # B
                 pipe.unet.config.in_channels,  # C
