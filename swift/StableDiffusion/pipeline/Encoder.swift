@@ -24,10 +24,23 @@ public struct Encoder: ResourceManaging {
     public init(modelAt url: URL, configuration: MLModelConfiguration) {
         self.model = ManagedMLModel(modelAt: url, configuration: configuration)
     }
-    
+
+    public var loadProgressWeights: [Int64] {
+        return [15]
+    }
+
+    public func makeLoadProgress() -> Progress {
+        let progress = Progress(totalUnitCount: self.loadProgressWeights.first!)
+        progress.localizedDescription = "Encoder"
+        return progress
+    }
+
     /// Ensure the model has been loaded into memory
-    public func loadResources() throws {
-        try model.loadResources()
+    public func loadResources(progress: Progress, prewarm: Bool) throws {
+        try model.loadResources(progress: progress)
+        if prewarm {
+            self.unloadResources()
+        }
     }
 
     /// Unload the underlying model to free up memory

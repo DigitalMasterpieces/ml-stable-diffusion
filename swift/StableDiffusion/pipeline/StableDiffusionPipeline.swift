@@ -38,8 +38,20 @@ public enum PipelineError: String, Swift.Error {
 }
 
 @available(iOS 16.2, macOS 13.1, *)
-public protocol StableDiffusionPipelineProtocol: ResourceManaging {
+public protocol StableDiffusionPipelineProtocol {
     var canSafetyCheck: Bool { get }
+
+    /// Request resources to be loaded and ready if possible
+    func loadResources(progress: Progress, onProgress: ((Double) -> Void)?) throws
+
+    /// Request resources are unloaded / remove from memory if possible
+    func unloadResources()
+
+    ///
+    func makeLoadProgress() -> Progress
+
+    ///
+    var loadProgressWeights: [Int64] { get }
 
     func generateImages(
         configuration config: PipelineConfiguration,
@@ -55,6 +67,43 @@ public protocol StableDiffusionPipelineProtocol: ResourceManaging {
 @available(iOS 16.2, macOS 13.1, *)
 public extension StableDiffusionPipelineProtocol {
     var canSafetyCheck: Bool { false }
+
+    public func loadModels(loadModels: [ResourceManaging], prewarmModels: [ResourceManaging], progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+        var i = 0
+
+        for model in prewarmModels {
+            let modelProgress = progress.children[i]
+            i += 1
+
+            progress.localizedDescription = modelProgress.localizedDescription
+
+            do {
+                try model.loadResources(progress: modelProgress, prewarm: true)
+            } catch {
+                print("Error prewarming resources for \(model): \(error)")
+            }
+
+            modelProgress.completedUnitCount = modelProgress.totalUnitCount
+            onProgress?(progress.fractionCompleted)
+        }
+
+        for model in loadModels {
+            let modelProgress = progress.children[i]
+            i += 1
+
+            progress.localizedDescription = modelProgress.localizedDescription
+
+            do {
+                try model.loadResources(progress: modelProgress, prewarm: false)
+            } catch {
+                print("Error loading resources for \(model): \(error)")
+            }
+
+            modelProgress.completedUnitCount = modelProgress.totalUnitCount
+            onProgress?(progress.fractionCompleted)
+        }
+    }
+
 }
 
 /// A pipeline used to generate image samples from text input using stable diffusion
@@ -129,6 +178,22 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         self.reduceMemory = reduceMemory
     }
 
+    public var loadProgressWeights: [Int64] {
+        var totalUnits: Int64 = 0
+
+        func add(_ units: Int64) {
+            totalUnits += units
+        }
+        add(textEncoder.loadProgressWeights.reduce(0, +))
+        add(unet.loadProgressWeights.reduce(0, +))
+        add(decoder.loadProgressWeights.reduce(0, +))
+        if let encoder = encoder { add(encoder.loadProgressWeights.reduce(0, +)) }
+        if let controlNet = controlNet { add(controlNet.loadProgressWeights.reduce(0, +)) }
+        if let safetyChecker = safetyChecker { add(safetyChecker.loadProgressWeights.reduce(0, +)) }
+
+        return [totalUnits]
+    }
+
     /// Creates a pipeline using the specified models and tokenizer
     ///
     /// - Parameters:
@@ -168,17 +233,18 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     ///
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
-    public func loadResources() throws {
+    public func loadResources(progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+        let loadModels: [ResourceManaging]
+        let prewarmModels: [ResourceManaging]
         if reduceMemory {
-            try prewarmResources()
+            loadModels = []
+            prewarmModels = [unet, textEncoder, decoder, encoder, controlNet, safetyChecker].compactMap{ $0 as? ResourceManaging }
         } else {
-            try unet.loadResources()
-            try textEncoder.loadResources()
-            try decoder.loadResources()
-            try encoder?.loadResources()
-            try controlNet?.loadResources()
-            try safetyChecker?.loadResources()
+            loadModels = [unet, textEncoder, decoder, encoder, controlNet, safetyChecker].compactMap{ $0 as? ResourceManaging }
+            prewarmModels = []
         }
+
+        try self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
     }
 
     /// Unload the underlying resources to free up memory
@@ -191,16 +257,6 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         safetyChecker?.unloadResources()
     }
 
-    // Prewarm resources one at a time
-    public func prewarmResources() throws {
-        try textEncoder.prewarmResources()
-        try unet.prewarmResources()
-        try decoder.prewarmResources()
-        try encoder?.prewarmResources()
-        try controlNet?.prewarmResources()
-        try safetyChecker?.prewarmResources()
-    }
-
     /// Image generation using stable diffusion
     /// - Parameters:
     ///   - configuration: Image generation configuration
@@ -209,7 +265,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     ///            The images will be nil if safety checks were performed and found the result to be un-safe
     public func generateImages(
         configuration config: Configuration,
-        progressHandler: (Progress) -> Bool = { _ in true }
+        progressHandler: (PipelineProgress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
 
         // Encode the input prompt
@@ -341,7 +397,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             let currentLatentSamples = config.useDenoisedIntermediates ? denoisedLatents : latents
 
             // Report progress
-            let progress = Progress(
+            let progress = PipelineProgress(
                 pipeline: self,
                 prompt: config.prompt,
                 step: step,
@@ -431,12 +487,6 @@ public struct PipelineProgress {
     }
 }
 
-@available(iOS 16.2, macOS 13.1, *)
-public extension StableDiffusionPipeline {
-    /// Sampling progress details
-    typealias Progress = PipelineProgress
-}
-
 // Helper functions
 
 @available(iOS 16.2, macOS 13.1, *)
@@ -486,5 +536,20 @@ extension StableDiffusionPipelineProtocol {
                 }
             }
         }
+    }
+}
+
+@available(iOS 16.2, macOS 13.1, *)
+extension StableDiffusionPipeline {
+
+    public func makeLoadProgress() -> Progress {
+        let totalUnits = self.loadProgressWeights.first!
+
+        let root = Progress(totalUnitCount: totalUnits)
+        root.localizedDescription = "Preparing pipeline"
+
+        // TODO
+
+        return root
     }
 }

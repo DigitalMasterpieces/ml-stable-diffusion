@@ -36,10 +36,23 @@ public struct MultilingualTextEncoder: TextEncoderModel {
         self.embeddingModel.requestAssets { _, _ in }
     }
 
+    public var loadProgressWeights: [Int64] {
+        return [10]
+    }
+
+    public func makeLoadProgress() -> Progress {
+        let progress = Progress(totalUnitCount: self.loadProgressWeights.first!)
+        progress.localizedDescription = "Multilingual Text Encoder"
+        return progress
+    }
+
     /// Loads model resources into memory.
-    public func loadResources() throws {
-        try adapter?.loadResources()
+    public func loadResources(progress: Progress, prewarm: Bool) throws {
+        try adapter?.loadResources(progress: progress)
         try embeddingModel.load()
+        if prewarm {
+            self.unloadResources()
+        }
     }
 
     /// Unloads the model resources to free up memory.

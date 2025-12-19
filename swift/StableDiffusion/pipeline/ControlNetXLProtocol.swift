@@ -5,16 +5,11 @@ import Foundation
 import CoreML
 
 @available(iOS 16.2, macOS 13.1, *)
-public protocol ControlNetXLProtocol {
+public protocol ControlNetXLProtocol: ResourceManaging {
     var models: [ManagedMLModel] { get }
-
-    func loadResources() throws
 
     /// Unload the underlying model to free up memory
     func unloadResources()
-
-    /// Pre-warm resources
-    func prewarmResources() throws
 
     var inputImageDescriptions: [MLFeatureDescription] { get }
 

@@ -16,8 +16,7 @@ import NaturalLanguage
 public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     
     public typealias Configuration = PipelineConfiguration
-    public typealias Progress = PipelineProgress
-    
+
     /// Model to generate embeddings for tokenized input text
     var textEncoder: TextEncoderXLModel?
     var textEncoder2: TextEncoderXLModel
@@ -80,45 +79,43 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         self.reduceMemory = reduceMemory
     }
 
+    public var loadProgressWeights: [Int64] {
+        var totalUnits: Int64 = 0
+
+        func add(_ units: Int64) {
+            totalUnits += units
+        }
+
+        add(textEncoder2.loadProgressWeights.reduce(0, +))
+        if let imageEncoder = imageEncoder { add(imageEncoder.loadProgressWeights.reduce(0, +)) }
+        add(unet.loadProgressWeights.reduce(0, +))
+        add(decoder.loadProgressWeights.reduce(0, +))
+        if let textEncoder = textEncoder { add(textEncoder.loadProgressWeights.reduce(0, +)) }
+        if let unetRefiner = unetRefiner { add(unetRefiner.loadProgressWeights.reduce(0, +)) }
+        if let encoder = encoder { add(encoder.loadProgressWeights.reduce(0, +)) }
+        if let controlNet = controlNet { add(controlNet.loadProgressWeights.reduce(0, +)) }
+
+        return [totalUnits]
+    }
+
     /// Load required resources for this pipeline
     ///
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
-    public func loadResources() throws {
+    public func loadResources(progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+        let loadModels: [ResourceManaging]
+        let prewarmModels: [ResourceManaging]
         if reduceMemory {
-            try prewarmResources()
+            loadModels = []
+            prewarmModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, unetRefiner, encoder, controlNet].compactMap{ $0 as? ResourceManaging }
         } else {
-            try textEncoder2.loadResources()
-            try imageEncoder?.loadResources()
-            try unet.loadResources()
-            try decoder.loadResources()
-
-            do {
-                try textEncoder?.loadResources()
-            } catch {
-                print("Error loading resources for textEncoder: \(error)")
-            }
-
-            // Only prewarm refiner unet on load so it's unloaded until needed
-            do {
-                try unetRefiner?.prewarmResources()
-            } catch {
-                print("Error loading resources for unetRefiner: \(error)")
-            }
-
-            do {
-                try encoder?.loadResources()
-            } catch {
-                print("Error loading resources for vae encoder: \(error)")
-            }
-
-            do {
-                try controlNet?.loadResources()
-            } catch {
-                print("Error loading resources for controlnet: \(error)")
-            }
+            loadModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, encoder, controlNet].compactMap{ $0 as ResourceManaging? }
+            prewarmModels = [unetRefiner].compactMap{ $0 as? ResourceManaging }
         }
+
+        try self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
     }
+
 
     /// Unload the underlying resources to free up memory
     public func unloadResources() {
@@ -132,37 +129,6 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         controlNet?.unloadResources()
     }
 
-    /// Prewarm resources one at a time
-    public func prewarmResources() throws {
-        try textEncoder2.prewarmResources()
-        try imageEncoder?.prewarmResources()
-        try unet.prewarmResources()
-        try decoder.prewarmResources()
-
-        do {
-            try textEncoder?.prewarmResources()
-        } catch {
-            print("Error prewarming resources for textEncoder: \(error)")
-        }
-
-        do {
-            try unetRefiner?.prewarmResources()
-        } catch {
-            print("Error prewarming resources for unetRefiner: \(error)")
-        }
-
-        do {
-            try encoder?.prewarmResources()
-        } catch {
-            print("Error prewarming resources for vae encoder: \(error)")
-        }
-
-        do {
-            try controlNet?.prewarmResources()
-        } catch {
-            print("Error prewarming resources for controlnet: \(error)")
-        }
-    }
     /// Image generation using stable diffusion
     /// - Parameters:
     ///   - configuration: Image generation configuration
@@ -171,7 +137,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     ///            The images will be nil if safety checks were performed and found the result to be un-safe
     public func generateImages(
         configuration config: Configuration,
-        progressHandler: (Progress) -> Bool = { _ in true }
+        progressHandler: (PipelineProgress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
 
         // Determine input type of Unet
@@ -183,6 +149,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         var baseInput: ModelInputs?
         var refinerInput: ModelInputs?
         var imageInputEmbeddings: ImageEncoderXLModel.ImageEncoderXLOutput?
+        var ipAdapterScale: Float?
 
         // Check if the first textEncoder is available, which is required for base models
         if textEncoder != nil {
@@ -193,8 +160,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         if let imageEncoder = self.imageEncoder {
             if let imageInput = config.imageInput {
                 imageInputEmbeddings = try imageEncoder.encode(imageInput)
+                ipAdapterScale = config.ipAdapterScale
             } else {
-                imageInputEmbeddings = MLShapedArray<Float32>(repeating: 0.0, shape: imageEncoder.imageEmbedsShape)
+                ipAdapterScale = 0.0
             }
         }
 
@@ -322,7 +290,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 geometryConditioning: geometryConditioning,
                 additionalResiduals: additionalResiduals,
                 imageEmbeds: imageInputEmbeddings,
-                ipAdapterScale: config.ipAdapterScale
+                ipAdapterScale: ipAdapterScale
             )
 
             noise = performGuidance(noise, config.guidanceScale)
@@ -342,7 +310,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             let currentLatentSamples = config.useDenoisedIntermediates ? denoisedLatents : latents
 
             // Report progress
-            let progress = Progress(
+            let progress = PipelineProgress(
                 pipeline: self,
                 prompt: config.prompt,
                 step: step,
@@ -494,5 +462,53 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         var hiddenStates: MLShapedArray<Float32>
         var pooledStates: MLShapedArray<Float32>
         var geometryConditioning: MLShapedArray<Float32>
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, *)
+extension StableDiffusionXLPipeline {
+
+    public func makeLoadProgress() -> Progress {
+        let totalUnits = self.loadProgressWeights.first!
+
+        let root = Progress(totalUnitCount: totalUnits)
+        root.localizedDescription = "Preparing pipeline"
+
+        let textEncoder2Progress = textEncoder2.makeLoadProgress()
+        root.addTrackedChild(textEncoder2Progress, units: textEncoder2Progress.totalUnitCount)
+
+        if let imageEncoder = imageEncoder {
+            let imageEncoderProgress = imageEncoder.makeLoadProgress()
+            root.addTrackedChild(imageEncoderProgress, units: imageEncoderProgress.totalUnitCount)
+        }
+
+        let unetProgress = unet.makeLoadProgress()
+        root.addTrackedChild(unetProgress, units: unetProgress.totalUnitCount)
+
+        // Decoder
+        let decoderProgress = decoder.makeLoadProgress()
+        root.addTrackedChild(decoderProgress, units: decoderProgress.totalUnitCount)
+
+        if let textEncoder = textEncoder {
+            let textEncoderProgress = textEncoder.makeLoadProgress()
+            root.addTrackedChild(textEncoderProgress, units: textEncoderProgress.totalUnitCount)
+        }
+
+        if let unetRefiner = unetRefiner {
+            let unetRefinerProgress = unetRefiner.makeLoadProgress()
+            root.addTrackedChild(unetRefinerProgress, units: unetRefinerProgress.totalUnitCount)
+        }
+
+        if let encoder = encoder {
+            let encoderProgress = encoder.makeLoadProgress()
+            root.addTrackedChild(encoderProgress, units: encoderProgress.totalUnitCount)
+        }
+
+        if let controlNet = controlNet {
+            let controlNetProgress = controlNet.makeLoadProgress()
+            root.addTrackedChild(controlNetProgress, units: controlNetProgress.totalUnitCount)
+        }
+
+        return root
     }
 }

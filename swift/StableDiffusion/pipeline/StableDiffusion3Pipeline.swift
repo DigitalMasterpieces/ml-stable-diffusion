@@ -10,7 +10,6 @@ import Foundation
 @available(iOS 17.0, macOS 14.0, *)
 public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
     public typealias Configuration = PipelineConfiguration
-    public typealias Progress = PipelineProgress
 
     /// Model to generate embeddings for tokenized input text
     var textEncoder: TextEncoderXLModel
@@ -61,26 +60,38 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
         self.reduceMemory = reduceMemory
     }
 
+    public var loadProgressWeights: [Int64] {
+        var totalUnits: Int64 = 0
+
+        func add(_ units: Int64) {
+            totalUnits += units
+        }
+        add(textEncoder.loadProgressWeights.reduce(0, +))
+        add(textEncoder2.loadProgressWeights.reduce(0, +))
+        add(mmdit.loadProgressWeights.reduce(0, +))
+        add(decoder.loadProgressWeights.reduce(0, +))
+        if let textEncoderT5 = textEncoderT5 { add(textEncoderT5.loadProgressWeights.reduce(0, +)) }
+        if let encoder = encoder { add(encoder.loadProgressWeights.reduce(0, +)) }
+
+        return [totalUnits]
+    }
+
     /// Load required resources for this pipeline
     ///
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
-    public func loadResources() throws {
+    public func loadResources(progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+        let loadModels: [ResourceManaging]
+        let prewarmModels: [ResourceManaging]
         if reduceMemory {
-            try prewarmResources()
+            loadModels = []
+            prewarmModels = [textEncoder, textEncoder2, textEncoderT5, mmdit, decoder, encoder].compactMap{ $0 as? ResourceManaging }
         } else {
-            try textEncoder.loadResources()
-            try textEncoder2.loadResources()
-            try textEncoderT5?.loadResources()
-            try mmdit.loadResources()
-            try decoder.loadResources()
-
-            do {
-                try encoder?.loadResources()
-            } catch {
-                print("Error loading resources for vae encoder: \(error)")
-            }
+            loadModels = [textEncoder, textEncoder2, textEncoderT5, mmdit, decoder, encoder].compactMap{ $0 as? ResourceManaging }
+            prewarmModels = []
         }
+
+        try self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
     }
 
     /// Unload the underlying resources to free up memory
@@ -93,21 +104,6 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
         encoder?.unloadResources()
     }
 
-    /// Prewarm resources one at a time
-    public func prewarmResources() throws {
-        try textEncoder.prewarmResources()
-        try textEncoder2.prewarmResources()
-        try textEncoderT5?.prewarmResources()
-        try mmdit.prewarmResources()
-        try decoder.prewarmResources()
-
-        do {
-            try encoder?.prewarmResources()
-        } catch {
-            print("Error prewarming resources for vae encoder: \(error)")
-        }
-    }
-
     /// Image generation using stable diffusion
     /// - Parameters:
     ///   - configuration: Image generation configuration
@@ -116,7 +112,7 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
     ///            The images will be nil if safety checks were performed and found the result to be un-safe
     public func generateImages(
         configuration config: Configuration,
-        progressHandler: (Progress) -> Bool = { _ in true }
+        progressHandler: (PipelineProgress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
         // Setup geometry conditioning for base/refiner inputs
         let sd3Input: ModelInputs = try generateConditioning(using: config)
@@ -186,7 +182,7 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
             let currentLatentSamples = config.useDenoisedIntermediates ? denoisedLatents : latents
 
             // Report progress
-            let progress = Progress(
+            let progress = PipelineProgress(
                 pipeline: self,
                 prompt: config.prompt,
                 step: step,
@@ -482,5 +478,20 @@ extension Array where Element == Float32 {
     /// Helper function to clamp the values within the specified range
     private func clamp(value: Float32, lower: UInt8, upper: UInt8) -> UInt8 {
         return UInt8(Swift.max(Float32(lower), Swift.min(value, Float32(upper))))
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, *)
+extension StableDiffusion3Pipeline {
+
+    public func makeLoadProgress() -> Progress {
+        let totalUnits = self.loadProgressWeights.first!
+
+        let root = Progress(totalUnitCount: totalUnits)
+        root.localizedDescription = "Preparing pipeline"
+
+        // TODO
+
+        return root
     }
 }

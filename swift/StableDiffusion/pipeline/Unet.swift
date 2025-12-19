@@ -35,25 +35,57 @@ public struct Unet: ResourceManaging {
         self.models = urls.map { ManagedMLModel(modelAt: $0, configuration: configuration) }
     }
 
+    public var loadProgressWeights: [Int64] {
+        if models.count == 1 {
+            return [70]
+        } else if models.count == 2 {
+            return [35, 35]
+        } else if models.count == 4 {
+            return [15, 20, 20, 15]
+        } else {
+            // Unsupported
+            assert(false)
+        }
+    }
+
+    public func makeLoadProgress() -> Progress {
+        let total = self.loadProgressWeights.reduce(0, +)
+        let progress = Progress(totalUnitCount: total)
+        progress.localizedDescription = "UNet"
+
+        for (index, units) in self.loadProgressWeights.enumerated() {
+            let chunkProgress = Progress(totalUnitCount: units)
+            chunkProgress.localizedDescription = "UNet block \(index + 1)"
+            progress.addTrackedChild(chunkProgress, units: units)
+        }
+
+        return progress
+    }
+
     /// Load resources.
-    public func loadResources() throws {
-        for model in models {
-            try model.loadResources()
+    public func loadResources(progress: Progress, prewarm: Bool) throws {
+        let chunks = progress.children
+        assert(chunks.count == self.loadProgressWeights.count)
+
+        for (index, chunkProgress) in chunks.enumerated() {
+            // Update label shown in UI
+            progress.rootProgress?.localizedDescription = chunkProgress.localizedDescription
+
+            // Do the actual work
+            try models[index].loadResources(progress: chunkProgress)
+
+            if prewarm {
+                models[index].unloadResources()
+            }
+
+            // Mark chunk complete
+            chunkProgress.completedUnitCount = chunkProgress.totalUnitCount
         }
     }
 
     /// Unload the underlying model to free up memory
     public func unloadResources() {
         for model in models {
-            model.unloadResources()
-        }
-    }
-
-    /// Pre-warm resources
-    public func prewarmResources() throws {
-        // Override default to pre-warm each model
-        for model in models {
-            try model.loadResources()
             model.unloadResources()
         }
     }
@@ -161,7 +193,7 @@ public struct Unet: ResourceManaging {
         geometryConditioning: MLShapedArray<Float32>,
         additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil,
         imageEmbeds: MLShapedArray<Float32>? = nil,
-        ipAdapterScale: Float = 1.0
+        ipAdapterScale: Float? = 1.0
     ) throws -> [MLShapedArray<Float32>] {
 
         // Match time step batch dimension to the model / latent samples
@@ -181,10 +213,12 @@ public struct Unet: ResourceManaging {
                     dict[k] = MLMultiArray(v)
                 }
             }
-            if let imageEmbeds = imageEmbeds {
+            if let ipAdapterScale = ipAdapterScale {
                 let ipAdapterScaleArray = MLShapedArray<Float32>(scalars: [Float(ipAdapterScale)],shape: [1])
-                dict["image_embeds"] = MLMultiArray(imageEmbeds)
                 dict["ip_adapter_scale"] = MLMultiArray(ipAdapterScaleArray)
+            }
+            if let imageEmbeds = imageEmbeds {
+                dict["image_embeds"] = MLMultiArray(imageEmbeds)
             }
             return try MLDictionaryFeatureProvider(dictionary: dict)
         }
@@ -276,3 +310,4 @@ public extension Array where Element == ManagedMLModel {
         return results
     }
 }
+

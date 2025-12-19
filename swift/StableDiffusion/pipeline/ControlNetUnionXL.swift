@@ -14,26 +14,30 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
                 configuration: MLModelConfiguration) {
         self.models = urls.map { ManagedMLModel(modelAt: $0, configuration: configuration) }
     }
-    
+
+    public var loadProgressWeights: [Int64] {
+        return [20]
+    }
+
+    public func makeLoadProgress() -> Progress {
+        let progress = Progress(totalUnitCount: self.loadProgressWeights.first!)
+        progress.localizedDescription = "Control Net (Union)"
+        return progress
+    }
+
     /// Load resources.
-    public func loadResources() throws {
+    public func loadResources(progress: Progress, prewarm: Bool) throws {
         for model in models {
-            try model.loadResources()
+            try model.loadResources(progress: progress)
+            if prewarm {
+                model.unloadResources()
+            }
         }
     }
 
     /// Unload the underlying model to free up memory
     public func unloadResources() {
         for model in models {
-            model.unloadResources()
-        }
-    }
-    
-    /// Pre-warm resources
-    public func prewarmResources() throws {
-        // Override default to pre-warm each model
-        for model in models {
-            try model.loadResources()
             model.unloadResources()
         }
     }

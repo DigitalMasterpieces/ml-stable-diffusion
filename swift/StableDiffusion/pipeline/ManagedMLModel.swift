@@ -9,7 +9,7 @@ import CryptoKit
 /// It will automatically load a model into memory when needed or requested
 /// It allows one to request to unload the model from memory
 @available(iOS 16.2, macOS 13.1, *)
-public final class ManagedMLModel: ResourceManaging {
+public final class ManagedMLModel {
 
     /// The location of the model
     var modelURL: URL
@@ -37,7 +37,7 @@ public final class ManagedMLModel: ResourceManaging {
     }
 
     /// Instantiation and load model into memory
-    public func loadResources() throws {
+    public func loadResources(progress: Progress) throws {
         try queue.sync {
             try loadModel()
         }
