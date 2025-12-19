@@ -36,15 +36,12 @@ public struct Unet: ResourceManaging {
     }
 
     public var loadProgressWeights: [Int64] {
-        if models.count == 1 {
-            return [70]
-        } else if models.count == 2 {
+        if models.count == 2 {
             return [35, 35]
         } else if models.count == 4 {
             return [15, 20, 20, 15]
         } else {
-            // Unsupported
-            assert(false)
+            return [70]
         }
     }
 
