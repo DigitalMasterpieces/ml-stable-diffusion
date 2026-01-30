@@ -210,10 +210,16 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         let controlNetConds: [[MLShapedArray<Float32>?]] = try config.controlNetInputs.map { modelImages in
             try modelImages.map { cgImageOpt in
                 if let shapedArray = try cgImageOpt?.planarRGBShapedArray(minValue: 0.0, maxValue: 1.0) {
-                    return MLShapedArray(
-                        concatenating: [shapedArray, shapedArray],
-                        alongAxis: 0
-                    )
+                    if config.useCFG {
+                        // CFG mode: duplicate for batch size 2
+                        return MLShapedArray(
+                            concatenating: [shapedArray, shapedArray],
+                            alongAxis: 0
+                        )
+                    } else {
+                        // No CFG mode: batch size 1
+                        return shapedArray
+                    }
                 }
                 return nil
             }
@@ -242,10 +248,17 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         // De-noising loop
         for (step,t) in timeSteps.enumerated() {
-            // Expand the latents for classifier-free guidance
+            // Expand the latents for classifier-free guidance (if using CFG)
             // and input to the Unet noise prediction model
-            var latentUnetInput = latents.map {
-                MLShapedArray<Float32>(concatenating: [$0, $0], alongAxis: 0)
+            var latentUnetInput: [MLShapedArray<Float32>]
+            if config.useCFG {
+                // CFG mode: duplicate latents for batch size 2
+                latentUnetInput = latents.map {
+                    MLShapedArray<Float32>(concatenating: [$0, $0], alongAxis: 0)
+                }
+            } else {
+                // No CFG mode: use latents directly with batch size 1
+                latentUnetInput = latents
             }
 
             for i in 0..<config.imageCount {
@@ -293,7 +306,10 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 ipAdapterScale: ipAdapterScale
             )
 
-            noise = performGuidance(noise, config.guidanceScale)
+            // Only perform guidance when CFG is enabled
+            if config.useCFG {
+                noise = performGuidance(noise, config.guidanceScale)
+            }
 
             // Have the scheduler compute the previous (t-1) latent
             // sample given the predicted noise and current sample
@@ -368,49 +384,86 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     func generateConditioning(using config: Configuration, forRefiner: Bool = false) throws -> ModelInputs {
         // Encode the input prompt and negative prompt
         let (promptEmbedding, pooled) = try encodePrompt(config.prompt, forRefiner: forRefiner)
-        let (negativePromptEmbedding, negativePooled) = try encodePrompt(config.negativePrompt, forRefiner: forRefiner)
 
-        // Convert to Unet hidden state representation
-        // Concatenate the prompt and negative prompt embeddings
-        let hiddenStates = toHiddenStates(MLShapedArray(concatenating: [negativePromptEmbedding, promptEmbedding], alongAxis: 0))
-        let pooledStates = MLShapedArray(concatenating: [negativePooled, pooled], alongAxis: 0)
+        let hiddenStates: MLShapedArray<Float32>
+        let pooledStates: MLShapedArray<Float32>
+        let geometry: MLShapedArray<Float32>
 
-        // Inline helper functions for geometry creation
-        func refinerGeometry() -> MLShapedArray<Float32> {
-            let negativeGeometry = MLShapedArray<Float32>(
-                scalars: [
-                    config.originalSize, config.originalSize,
-                    config.cropsCoordsTopLeft, config.cropsCoordsTopLeft,
-                    config.negativeAestheticScore
-                ],
-                shape: [1, 5]
-            )
-            let positiveGeometry = MLShapedArray<Float32>(
-                scalars: [
-                    config.originalSize, config.originalSize,
-                    config.cropsCoordsTopLeft, config.cropsCoordsTopLeft,
-                    config.aestheticScore
-                ],
-                shape: [1, 5]
-            )
-            return MLShapedArray<Float32>(concatenating: [negativeGeometry, positiveGeometry], alongAxis: 0)
+        if config.useCFG {
+            // CFG mode: batch size 2 with negative + positive embeddings
+            let (negativePromptEmbedding, negativePooled) = try encodePrompt(config.negativePrompt, forRefiner: forRefiner)
+
+            // Convert to Unet hidden state representation
+            // Concatenate the prompt and negative prompt embeddings
+            hiddenStates = toHiddenStates(MLShapedArray(concatenating: [negativePromptEmbedding, promptEmbedding], alongAxis: 0))
+            pooledStates = MLShapedArray(concatenating: [negativePooled, pooled], alongAxis: 0)
+
+            // Inline helper functions for geometry creation
+            func refinerGeometry() -> MLShapedArray<Float32> {
+                let negativeGeometry = MLShapedArray<Float32>(
+                    scalars: [
+                        config.originalSize, config.originalSize,
+                        config.cropsCoordsTopLeft, config.cropsCoordsTopLeft,
+                        config.negativeAestheticScore
+                    ],
+                    shape: [1, 5]
+                )
+                let positiveGeometry = MLShapedArray<Float32>(
+                    scalars: [
+                        config.originalSize, config.originalSize,
+                        config.cropsCoordsTopLeft, config.cropsCoordsTopLeft,
+                        config.aestheticScore
+                    ],
+                    shape: [1, 5]
+                )
+                return MLShapedArray<Float32>(concatenating: [negativeGeometry, positiveGeometry], alongAxis: 0)
+            }
+
+            func baseGeometry() -> MLShapedArray<Float32> {
+                let geom = MLShapedArray<Float32>(
+                    scalars: [
+                        config.originalSize, config.originalSize,
+                        config.cropsCoordsTopLeft, config.cropsCoordsTopLeft,
+                        config.targetSize, config.targetSize
+                    ],
+                    // TODO: This checks if the time_ids input is looking for [12] or [2, 6]
+                    // Remove once model input shapes are ubiquitous
+                    shape: unet.latentTimeIdShape.count > 1 ? [1, 6] : [6]
+                )
+                return MLShapedArray<Float32>(concatenating: [geom, geom], alongAxis: 0)
+            }
+
+            geometry = forRefiner ? refinerGeometry() : baseGeometry()
+        } else {
+            // No CFG mode: batch size 1 with only positive embedding
+            hiddenStates = toHiddenStates(promptEmbedding)
+            pooledStates = pooled
+
+            // Single geometry for batch size 1
+            func refinerGeometrySingle() -> MLShapedArray<Float32> {
+                return MLShapedArray<Float32>(
+                    scalars: [
+                        config.originalSize, config.originalSize,
+                        config.cropsCoordsTopLeft, config.cropsCoordsTopLeft,
+                        config.aestheticScore
+                    ],
+                    shape: [1, 5]
+                )
+            }
+
+            func baseGeometrySingle() -> MLShapedArray<Float32> {
+                return MLShapedArray<Float32>(
+                    scalars: [
+                        config.originalSize, config.originalSize,
+                        config.cropsCoordsTopLeft, config.cropsCoordsTopLeft,
+                        config.targetSize, config.targetSize
+                    ],
+                    shape: unet.latentTimeIdShape.count > 1 ? [1, 6] : [6]
+                )
+            }
+
+            geometry = forRefiner ? refinerGeometrySingle() : baseGeometrySingle()
         }
-
-        func baseGeometry() -> MLShapedArray<Float32> {
-            let geometry = MLShapedArray<Float32>(
-                scalars: [
-                    config.originalSize, config.originalSize,
-                    config.cropsCoordsTopLeft, config.cropsCoordsTopLeft,
-                    config.targetSize, config.targetSize
-                ],
-                // TODO: This checks if the time_ids input is looking for [12] or [2, 6]
-                // Remove once model input shapes are ubiquitous
-                shape: unet.latentTimeIdShape.count > 1 ? [1, 6] : [6]
-            )
-            return MLShapedArray<Float32>(concatenating: [geometry, geometry], alongAxis: 0)
-        }
-
-        let geometry = forRefiner ? refinerGeometry() : baseGeometry()
 
         return ModelInputs(hiddenStates: hiddenStates, pooledStates: pooledStates, geometryConditioning: geometry)
     }

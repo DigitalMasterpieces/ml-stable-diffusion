@@ -97,7 +97,14 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
         images: [[MLShapedArray<Float32>?]]
     ) throws -> [[String: MLShapedArray<Float32>]] {
         // Match time step batch dimension to the model / latent samples
-        let t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
+        // Infer batch size from hiddenStates shape (batch size 2 for CFG, 1 for no CFG)
+        let batchSize = hiddenStates.shape[0]
+        let t: MLShapedArray<Float32>
+        if batchSize == 2 {
+            t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
+        } else {
+            t = MLShapedArray(scalars: [Float(timeStep)], shape: [1])
+        }
 
         var outputs: [[String: MLShapedArray<Float32>]] = Array(repeating: [:], count: latents.count)
 
@@ -115,10 +122,23 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
                 // Setup the control net type mask for the specific control ID
                 let controlNetTotalIDs = conditioningScales[modelIndex].count
                 let controlTypeIDMask: [UInt] = (0..<controlNetTotalIDs).map { $0 == controlID ? 1 : 0 }
-                let controlTypeIDMaskArray =
-                    MLShapedArray<Float32>(
+                let controlTypeIDMaskArray: MLShapedArray<Float32>
+                if batchSize == 2 {
+                    controlTypeIDMaskArray = MLShapedArray<Float32>(
                         scalars: Array(repeating: controlTypeIDMask.map { Float32($0) }, count: 2).flatMap { $0 },
                         shape: [2, controlTypeIDMask.count]
+                    )
+                } else {
+                    controlTypeIDMaskArray = MLShapedArray<Float32>(
+                        scalars: controlTypeIDMask.map { Float32($0) },
+                        shape: [1, controlTypeIDMask.count]
+                    )
+                }
+
+                let conditioningScalesArray =
+                    MLShapedArray<Float32>(
+                        scalars: conditioningScales[modelIndex],
+                        shape: [controlNetTotalIDs]
                     )
 
                 let inputs = try latents.map { latent in
@@ -127,7 +147,8 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
                         "timestep": MLMultiArray(t),
                         "encoder_hidden_states": MLMultiArray(hiddenStates),
                         "control_type": MLMultiArray(controlTypeIDMaskArray),
-                        "controlnet_cond_\(controlID)": MLMultiArray(controlImage)
+                        "controlnet_cond_\(controlID)": MLMultiArray(controlImage),
+                        "conditioning_scale": MLMultiArray(conditioningScalesArray)
                     ]
 
                     return try MLDictionaryFeatureProvider(dictionary: dict)
@@ -153,7 +174,7 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
 
                         // Direct scaling into MLMultiArray memory.
                         vDSP_vsmul(inputPointer, 1,
-                                    [conditioningScale],
+                                   [1.0], // conditioningScale
                                     scaledPointer, 1,
                                     vDSP_Length(count))
 

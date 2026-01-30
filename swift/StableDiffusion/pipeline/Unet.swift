@@ -194,7 +194,14 @@ public struct Unet: ResourceManaging {
     ) throws -> [MLShapedArray<Float32>] {
 
         // Match time step batch dimension to the model / latent samples
-        let t = MLShapedArray<Float32>(scalars:[Float(timeStep), Float(timeStep)],shape:[2])
+        // Infer batch size from hiddenStates shape (batch size 2 for CFG, 1 for no CFG)
+        let batchSize = hiddenStates.shape[0]
+        let t: MLShapedArray<Float32>
+        if batchSize == 2 {
+            t = MLShapedArray<Float32>(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
+        } else {
+            t = MLShapedArray<Float32>(scalars: [Float(timeStep)], shape: [1])
+        }
 
         // Form batch input to model
         let inputs = try latents.enumerated().map {

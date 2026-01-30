@@ -39,6 +39,9 @@ public struct PipelineConfiguration: Hashable {
     public var seed: UInt32 = 0
     /// Controls the influence of the text prompt on sampling process (0=random images)
     public var guidanceScale: Float = 7.5
+    /// Whether to use Classifier-Free Guidance (CFG) with batch size 2.
+    /// When false, runs with batch size 1 (optimized for distilled models like SDXL Lightning)
+    public var useCFG: Bool = true
     /// List of Images for available ControlNet Models
     public var controlNetInputs: [[CGImage?]] = []
     /// ControlNet conditioning scale
