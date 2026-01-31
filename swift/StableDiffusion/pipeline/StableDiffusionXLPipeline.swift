@@ -282,7 +282,10 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 throw PipelineError.missingUnetInputs
             }
 
-            let additionalResiduals = try controlNet?.execute(
+            // Execute ControlNet if present, converting empty results to nil
+            // to avoid subscript crashes in Unet when no ControlNet images provided.
+            var additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
+            if let controlNetResult = try controlNet?.execute(
                 latents: latentUnetInput,
                 timeStep: t,
                 hiddenStates: hiddenStates,
@@ -291,7 +294,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 conditioningScales: config.controlNetConditioningScales,
                 controlTypes: config.controlNetTypes,
                 images: controlNetConds
-            )
+            ), !controlNetResult.isEmpty {
+                additionalResiduals = controlNetResult
+            }
 
             // Predict noise residuals from latent samples
             // and current time step conditioned on hidden states

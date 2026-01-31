@@ -96,6 +96,15 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
         controlTypes: [[UInt]],
         images: [[MLShapedArray<Float32>?]]
     ) throws -> [[String: MLShapedArray<Float32>]] {
+        // OPTIMIZATION: Early return if no ControlNet images are provided.
+        // This avoids allocating zero tensors when ControlNet is not actively used.
+        let hasAnyImage = images.contains { modelImages in
+            modelImages.contains { $0 != nil }
+        }
+        if !hasAnyImage {
+            return []
+        }
+
         // Match time step batch dimension to the model / latent samples
         // Infer batch size from hiddenStates shape (batch size 2 for CFG, 1 for no CFG)
         let batchSize = hiddenStates.shape[0]
