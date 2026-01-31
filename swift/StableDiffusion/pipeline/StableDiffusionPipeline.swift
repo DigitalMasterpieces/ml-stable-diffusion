@@ -403,7 +403,8 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                 step: step,
                 stepCount: timeSteps.count,
                 currentLatentSamples: currentLatentSamples,
-                configuration: config
+                configuration: config,
+                phase: .denoising
             )
             if !progressHandler(progress) {
                 // Stop if requested by handler
@@ -473,12 +474,20 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 /// Sampling progress details
 @available(iOS 16.2, macOS 13.1, *)
 public struct PipelineProgress {
+    /// The current phase of image generation
+    public enum Phase {
+        case encoding      // Text/image encoding before denoising
+        case denoising     // Main denoising loop
+        case decoding      // VAE decoding at the end
+    }
+
     public let pipeline: StableDiffusionPipelineProtocol
     public let prompt: String
     public let step: Int
     public let stepCount: Int
     public let currentLatentSamples: [MLShapedArray<Float32>]
     public let configuration: PipelineConfiguration
+    public let phase: Phase
     public var isSafetyEnabled: Bool {
         pipeline.canSafetyCheck && !configuration.disableSafety
     }

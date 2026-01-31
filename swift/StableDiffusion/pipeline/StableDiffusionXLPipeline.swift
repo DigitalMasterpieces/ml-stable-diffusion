@@ -151,6 +151,18 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         var imageInputEmbeddings: ImageEncoderXLModel.ImageEncoderXLOutput?
         var ipAdapterScale: Float?
 
+        // Report encoding phase before text encoding starts
+        let encodingProgress = PipelineProgress(
+            pipeline: self,
+            prompt: config.prompt,
+            step: -1,
+            stepCount: config.stepCount,
+            currentLatentSamples: [],
+            configuration: config,
+            phase: .encoding
+        )
+        if !progressHandler(encodingProgress) { return [] }
+
         // Check if the first textEncoder is available, which is required for base models
         if textEncoder != nil {
             baseInput = try generateConditioning(using: config, forRefiner: isRefiner)
@@ -337,7 +349,8 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 step: step,
                 stepCount: timeSteps.count,
                 currentLatentSamples: currentLatentSamples,
-                configuration: config
+                configuration: config,
+                phase: .denoising
             )
             if !progressHandler(progress) {
                 // Stop if requested by handler
@@ -351,6 +364,18 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             unet.unloadResources()
         }
         unetRefiner?.unloadResources()
+
+        // Report decoding phase
+        let decodingProgress = PipelineProgress(
+            pipeline: self,
+            prompt: config.prompt,
+            step: timeSteps.count,
+            stepCount: timeSteps.count,
+            currentLatentSamples: denoisedLatents,
+            configuration: config,
+            phase: .decoding
+        )
+        _ = progressHandler(decodingProgress)
 
         // Decode the latent samples to images
         return try decodeToImages(denoisedLatents, configuration: config)

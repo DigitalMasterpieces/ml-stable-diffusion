@@ -188,7 +188,8 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
                 step: step,
                 stepCount: timeSteps.count,
                 currentLatentSamples: currentLatentSamples,
-                configuration: config
+                configuration: config,
+                phase: .denoising
             )
 
             if !progressHandler(progress) {
