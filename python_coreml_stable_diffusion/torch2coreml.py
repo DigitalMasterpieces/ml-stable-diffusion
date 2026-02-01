@@ -469,7 +469,7 @@ def _determine_image_encoder_output_mode(image_encoder):
 
     return mode
 
-def convert_image_encoder(image_encoder, submodule_name, args):
+def convert_image_encoder(image_encoder, submodule_name, args, do_classifier_free_guidance=True):
     """ Converts image encoder for Stable Diffusion
     """
     if image_encoder is None:
@@ -505,10 +505,11 @@ def convert_image_encoder(image_encoder, submodule_name, args):
 
     class ImageEncoder(nn.Module):
 
-        def __init__(self, mode):
+        def __init__(self, mode, do_cfg):
             super().__init__()
             self.image_encoder = image_encoder
             self.mode = mode
+            self.do_cfg = do_cfg
             # CLIP normalization
             _means = [0.48145466, 0.4578275, 0.40821073]
             _stds = [0.26862954, 0.26130258, 0.27577711]
@@ -524,24 +525,19 @@ def convert_image_encoder(image_encoder, submodule_name, args):
         def forward(self, input_image):
             input_image_normalized = self.transform_model(input_image)
 
-            if mode == "hidden_states":
+            if self.mode == "hidden_states":
                 image_embeds = self.image_encoder(input_image_normalized, output_hidden_states=True).hidden_states[-2]
             else:
                 image_embeds = self.image_encoder(input_image_normalized, output_hidden_states=False).image_embeds
 
-            negative_image_embeds = torch.zeros_like(image_embeds)
-
-            do_classifier_free_guidance = True
-
-            if mode == "hidden_states":
-                if do_classifier_free_guidance:
+            if self.mode == "hidden_states":
+                if self.do_cfg:
                     return torch.cat([image_embeds, image_embeds], dim=0)
                 else:
                     return image_embeds
             else:
                 image_embeds = image_embeds[None, :]
-                negative_image_embeds = negative_image_embeds[None, :]
-                if do_classifier_free_guidance:
+                if self.do_cfg:
                     return torch.cat([image_embeds, image_embeds], dim=0)
                 else:
                     return image_embeds
@@ -549,7 +545,7 @@ def convert_image_encoder(image_encoder, submodule_name, args):
     mode = _determine_image_encoder_output_mode(image_encoder)
 
     hidden_layer = None
-    reference_image_encoder = ImageEncoder(mode).eval()
+    reference_image_encoder = ImageEncoder(mode, do_classifier_free_guidance).eval()
 
     logger.info(f"JIT tracing..")
     reference_image_encoder = torch.jit.trace(
@@ -874,12 +870,12 @@ def convert_vae_decoder_sd3(args):
             f"`vae_decoder` already exists at {out_path}, skipping conversion."
         )
         return
-    
+
     # Convert the VAE Decoder model via DiffusionKit
     converted_vae_path = convert_vae_to_mlpackage(
-        model_version=args.model_version, 
-        latent_h=args.latent_h, 
-        latent_w=args.latent_w, 
+        model_version=args.model_version,
+        latent_h=args.latent_h,
+        latent_w=args.latent_w,
         output_dir=args.o,
     )
 
@@ -1287,6 +1283,18 @@ def convert_unet(pipe, args, model_name=None):
         del reference_unet
         gc.collect()
 
+        # Make additional residuals from ControlNet optional (if defined)
+        if args.unet_support_controlnet:
+            spec = coreml_unet.get_spec()
+
+            # Loop over all inputs in the model description
+            for input_type in spec.description.input:
+                if input_type.name.startswith("additional_residual"):
+                    input_type.type.isOptional = True
+
+            # Update model
+            coreml_unet = ct.models.MLModel(spec, weights_dir=coreml_unet.weights_dir)
+
         # Make image prompt input optional (if defined)
         if args.xl_version and pipe.image_encoder is not None:
             spec = coreml_unet.get_spec()
@@ -1361,13 +1369,14 @@ def convert_unet(pipe, args, model_name=None):
 def fix_optional_inputs(mlpackage_path, optional_input_names):
     """
     Re-mark specific inputs as optional in a CoreML mlpackage.
+    Inputs are marked optional if their name starts with any string in optional_input_names.
     """
     model = ct.models.MLModel(mlpackage_path)
     spec = model.get_spec()
 
     changed = False
     for input_type in spec.description.input:
-        if input_type.name in optional_input_names:
+        if input_type.name.startswith(tuple(optional_input_names)):
             input_type.type.isOptional = True
             changed = True
 
@@ -1377,7 +1386,7 @@ def fix_optional_inputs(mlpackage_path, optional_input_names):
     else:
         logger.info(f"No optional inputs to patch in {mlpackage_path}")
 
-def chunk_unet(pipe, args, model_name=None):
+def chunk_unet(args, model_name=None):
     """ Chunks the UNet component of Stable Diffusion
     """
     if args.unet_support_controlnet:
@@ -1444,7 +1453,7 @@ def chunk_unet(pipe, args, model_name=None):
                 # Fix: After chunking, the optional input flags are lost. So let's make the image prompt input optional again (if defined)
                 fix_optional_inputs(
                     dst_path,
-                    optional_input_names={"image_embeds"},
+                    optional_input_names={"image_embeds", "additional_residual"},
                 )
 
             # Delete original unet
@@ -1462,12 +1471,12 @@ def convert_mmdit(args):
             f"`mmdit` already exists at {out_path}, skipping conversion."
         )
         return
-    
+
     # Convert the MMDiT model via DiffusionKit
     converted_mmdit_path = convert_mmdit_to_mlpackage(
-        model_version=args.model_version, 
-        latent_h=args.latent_h, 
-        latent_w=args.latent_w, 
+        model_version=args.model_version,
+        latent_h=args.latent_h,
+        latent_w=args.latent_w,
         output_dir=args.o,
         # FIXME: Hardcoding to CPU_AND_GPU since ANE doesn't support FLOAT32
         compute_precision=ct.precision.FLOAT32,
@@ -1843,6 +1852,10 @@ def convert_controlnet(pipe, args):
                     .repeat(control_type_repeat_factor, 1)
                 )
                 sample_controlnet_inputs['control_type'] = control_type
+                conditioning_scale = torch.ones(
+                    (num_control_type,)
+                )
+                sample_controlnet_inputs['conditioning_scale'] = conditioning_scale
             else:
                 num_control_type = 1
                 sample_controlnet_inputs['controlnet_cond'] = torch.rand(*controlnet_cond_shape)
@@ -1934,6 +1947,8 @@ def convert_controlnet(pipe, args):
                 "An additional input image for ControlNet to condition the generated images."
             coreml_controlnet.input_description["control_type"] = \
             "A tensor with values `0` or `1` depending on whether the control type is used."
+            coreml_controlnet.input_description["conditioning_scale"] = \
+            "A tensor with values between `0` and `1` used as conditioning scales."
 
         # Set the output descriptions
         for i in range(num_residuals):
@@ -2051,7 +2066,8 @@ def main(args):
 
     if args.convert_image_encoder:
         logger.info("Converting image_encoder")
-        convert_image_encoder(pipe.image_encoder, "image_encoder", args)
+        do_classifier_free_guidance = not args.unet_batch_one
+        convert_image_encoder(pipe.image_encoder, "image_encoder", args, do_classifier_free_guidance)
         logger.info("Converted image_encoder")
 
     if args.convert_safety_checker:
@@ -2066,12 +2082,12 @@ def main(args):
         original_model_version = args.model_version
         args.model_version = args.refiner_version
         pipe = get_pipeline(args)
-        args.model_version = original_model_version 
+        args.model_version = original_model_version
         convert_unet(pipe, args, model_name="refiner")
         del pipe
         gc.collect()
         logger.info(f"Converted refiner")
-    
+
     if args.convert_mmdit:
         logger.info("Converting mmdit")
         convert_mmdit(args)
@@ -2084,7 +2100,7 @@ def main(args):
 
     if args.unet_chunks is not None:
         logger.info("Chunking unet")
-        chunk_unet(pipe, args)
+        chunk_unet(args)
         logger.info("Chunking unet")
 
     if args.bundle_resources_for_swift_cli:
@@ -2104,8 +2120,8 @@ def parser_spec():
     parser.add_argument("--convert-mmdit", action="store_true")
     parser.add_argument("--convert-safety-checker", action="store_true")
     parser.add_argument(
-        "--convert-controlnet", 
-        nargs="*", 
+        "--convert-controlnet",
+        nargs="*",
         type=str,
         help=
         "Converts a ControlNet model hosted on HuggingFace to CoreML format. " \
