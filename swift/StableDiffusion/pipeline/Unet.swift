@@ -40,6 +40,11 @@ public struct Unet: ResourceManaging {
             return [35, 35]
         } else if models.count == 4 {
             return [15, 20, 20, 15]
+        } else if models.count == 9 {
+            // Architectural 9-chunk: AlphaA, AlphaB, Gamma, Sigma, ThetaA, ThetaB, Lambda, Kappa, Omega
+            // AlphaEncoder split into AlphaA (time emb) and AlphaB (IP-Adapter + conv_in + down_blocks[0,1])
+            // ThetaUpblock split into ThetaA (1 layer) and ThetaB (2 layers + upsampler)
+            return [2, 16, 12, 12, 6, 8, 10, 10, 4]  // Total: 80
         } else {
             return [70]
         }
@@ -88,8 +93,14 @@ public struct Unet: ResourceManaging {
     }
 
     var latentSampleDescription: MLFeatureDescription {
-        try! models.first!.perform { model in
-            model.modelDescription.inputDescriptionsByName["sample"]!
+        if models.count == 9 {
+            try! models[1].perform { model in
+                model.modelDescription.inputDescriptionsByName["sample"]!
+            }
+        } else {
+            try! models.first!.perform { model in
+                model.modelDescription.inputDescriptionsByName["sample"]!
+            }
         }
     }
 
@@ -232,6 +243,8 @@ public struct Unet: ResourceManaging {
         let results: MLBatchProvider
         if models.count == 4 {
             results = try models.unet_quad_predictions(from: batch)
+        } else if models.count == 9 {
+            results = try models.unet_architectural_predictions(from: batch)
         } else {
             results = try models.predictions(from: batch)
         }
@@ -305,6 +318,117 @@ public extension Array where Element == ManagedMLModel {
             let nextBatch = MLArrayBatchProvider(array: providers)
 
             // predict
+            results = try stage.perform { model in
+                try model.predictions(fromBatch: nextBatch)
+            }
+            stageOutputs.append(results.arrayOfFeatureValueDictionaries)
+        }
+
+        return results
+    }
+
+    /// Performs batch predictions for architectural 9-chunk UNet pipeline (SDXL)
+    /// Chunks: AlphaEncoderA → AlphaEncoderB → GammaDownblock → SigmaCore → ThetaUpblockA → ThetaUpblockB → LambdaUpblock → KappaUpblock → OmegaDecoder
+    func unet_architectural_predictions(from batch: MLBatchProvider) throws -> MLBatchProvider {
+        // Output name to input name mapping
+        // CoreML models use "_out" suffix on outputs to avoid name conflicts
+        // But subsequent chunks expect input names without the suffix
+        let outputToInputNameMap: [String: String] = [
+            // AlphaEncoderA outputs → inputs for subsequent chunks
+            "emb_out": "emb",
+            // AlphaEncoderB outputs → inputs for subsequent chunks
+            "ip_hidden_states_out": "ip_hidden_states",
+            "hidden_out": "hidden",
+            // Skip connections keep their names (no _out suffix in outputs)
+        ]
+
+        // Stage-specific skip mappings (different stages need different mappings)
+        // The skip connections flow from encoder to decoder in reverse order
+        // Note: Output names use numeric indices (skip_down0_2) not _ds suffix
+        //
+        // SDXL up_blocks[0] skip consumption order (reverse of down_blocks[2] + tail of down_blocks[1]):
+        //   resnet_0 <- skip_down2_1 (1280 ch)  [ThetaUpblockA]
+        //   resnet_1 <- skip_down2_0 (1280 ch)  [ThetaUpblockB]
+        //   resnet_2 <- skip_down1_2 (640 ch)   [ThetaUpblockB]
+        let stageSkipMappings: [Int: [String: String]] = [
+            // Stage 4 (ThetaUpblockA): needs Gamma's skip_down2_1 as skip_0
+            4: ["skip_down2_1": "skip_0"],
+            // Stage 5 (ThetaUpblockB): needs Gamma's skip_down2_0 as skip_0, AlphaB's skip_down1_2 as skip_1
+            5: ["skip_down2_0": "skip_0", "skip_down1_2": "skip_1"],
+            // Stage 6 (LambdaUpblock): needs AlphaB's skip_down1_1, skip_down1_0, skip_down0_2
+            6: ["skip_down1_1": "skip_0", "skip_down1_0": "skip_1", "skip_down0_2": "skip_2"],
+            // Stage 7 (KappaUpblock): needs AlphaB's skip_down0_1, skip_down0_0, skip_conv_in
+            7: ["skip_down0_1": "skip_0", "skip_down0_0": "skip_1", "skip_conv_in": "skip_2"],
+        ]
+
+        // Dependencies based on skip connection flow:
+        // Stage 0 (AlphaA): base inputs (timestep, time_ids, text_embeds) - produces emb_out
+        // Stage 1 (AlphaB): needs [0] emb - produces ip_hidden_states_out, skip_conv_in, skip_down0_*, skip_down1_*, hidden_out
+        // Stage 2 (Gamma): needs [1] hidden, [0] emb, encoder_hidden_states - produces skip_down2_*, hidden_out
+        // Stage 3 (Sigma): needs [2] hidden, [0] emb - produces hidden_out
+        // Stage 4 (ThetaA): needs [3] hidden, [0] emb, [2] skip_down2_1 - produces hidden_out
+        // Stage 5 (ThetaB): needs [4] hidden, [0] emb, [1] skip_down1_2, [2] skip_down2_0 - produces hidden_out (upsampled)
+        // Stage 6 (Lambda): needs [5] hidden, [0] emb, [1] skips - produces hidden_out
+        // Stage 7 (Kappa): needs [6] hidden, [0] emb, [1] skips - produces hidden_out
+        // Stage 8 (Omega): needs [7] hidden, [1] skip_conv_in - produces noise_pred
+
+        let dependencies: [[Int]] = [
+            [],              // Stage 0: AlphaEncoderA - base inputs (timestep, time_ids, text_embeds)
+            [0],             // Stage 1: AlphaEncoderB - needs AlphaA emb
+            [0, 1],          // Stage 2: GammaDownblock - needs AlphaB hidden + AlphaA emb
+            [0, 1, 2],       // Stage 3: SigmaCore - needs Gamma hidden + AlphaA emb
+            [0, 1, 2, 3],    // Stage 4: ThetaUpblockA - needs Sigma hidden + AlphaA emb + Gamma skip_down2_1
+            [0, 1, 2, 4],    // Stage 5: ThetaUpblockB - needs ThetaA hidden + AlphaA emb + AlphaB skip_down1_2 + Gamma skip_down2_0
+            [0, 1, 5],       // Stage 6: LambdaUpblock - needs ThetaB hidden + AlphaA emb + AlphaB skips
+            [0, 1, 6],       // Stage 7: KappaUpblock - needs Lambda hidden + AlphaA emb + AlphaB skips
+            [0, 1, 7]        // Stage 8: OmegaDecoder - needs Kappa hidden + AlphaB skip_conv_in
+        ]
+
+        let inputs = batch.arrayOfFeatureValueDictionaries
+        var stageOutputs: [[[String: MLFeatureValue]]] = []
+
+        // --- Stage 0 (AlphaEncoder) ---
+        var results = try self.first!.perform { model in
+            try model.predictions(fromBatch: batch)
+        }
+        stageOutputs.append(results.arrayOfFeatureValueDictionaries)
+
+        // --- Remaining stages ---
+        for (stageIndex, stage) in self.dropFirst().enumerated() {
+            let actualIndex = stageIndex + 1
+
+            // Get stage-specific skip mappings if any
+            let skipMap = stageSkipMappings[actualIndex] ?? [:]
+
+            let mergedInputDicts: [[String: MLFeatureValue]] =
+                (0..<inputs.count).map { sampleIndex in
+                    var merged = inputs[sampleIndex]
+
+                    for dep in dependencies[actualIndex] {
+                        let depDict = stageOutputs[dep][sampleIndex]
+                        for (outputName, value) in depDict {
+                            // First check stage-specific skip mappings
+                            if let inputName = skipMap[outputName] {
+                                merged[inputName] = value
+                            }
+                            // Then check general output→input mapping
+                            else if let inputName = outputToInputNameMap[outputName] {
+                                merged[inputName] = value
+                            }
+                            // Otherwise use the output name as-is
+                            else {
+                                merged[outputName] = value
+                            }
+                        }
+                    }
+                    return merged
+                }
+
+            let providers = try mergedInputDicts.map {
+                try MLDictionaryFeatureProvider(dictionary: $0)
+            }
+            let nextBatch = MLArrayBatchProvider(array: providers)
+
             results = try stage.perform { model in
                 try model.predictions(fromBatch: nextBatch)
             }

@@ -5,7 +5,7 @@
 #
 
 from python_coreml_stable_diffusion import (
-    unet, controlnet, controlnetunion, chunk_mlprogram
+    unet, controlnet, controlnetunion, chunk_mlprogram, unet_architectural_chunks
 )
 
 from python_coreml_stable_diffusion.unet import AttnProcessor2_0, IPAdapterAttnProcessor2_0, UNet2DConditionModelXLWithoutIPAdapter
@@ -191,7 +191,11 @@ def _get_deployment_target(target_string):
 def quantize_weights(args):
     """ Quantize weights to args.quantize_nbits using a palette (look-up table)
     """
-    for model_name in ["text_encoder", "text_encoder_2", "image_encoder", "unet", "refiner", "control-unet"]:
+    # Optional inputs that need to be restored after quantization
+    # (quantization loses the isOptional flag)
+    controlnet_optional_inputs = ["additional_residual", "image_embeds"]
+
+    for model_name in ["text_encoder", "text_encoder_2", "image_encoder", "unet", "refiner"]:
         logger.info(f"Quantizing {model_name} to {args.quantize_nbits}-bit precision")
         out_path = _get_out_path(args, model_name)
         _quantize_weights(
@@ -199,6 +203,16 @@ def quantize_weights(args):
             model_name,
             args.quantize_nbits
         )
+
+    # control-unet has optional ControlNet residual inputs and image_embeds
+    logger.info(f"Quantizing control-unet to {args.quantize_nbits}-bit precision")
+    out_path = _get_out_path(args, "control-unet")
+    _quantize_weights(
+        out_path,
+        "control-unet",
+        args.quantize_nbits,
+        restore_optional_inputs=controlnet_optional_inputs
+    )
 
     if args.convert_controlnet:
         for controlnet_model_version in args.convert_controlnet:
@@ -212,7 +226,43 @@ def quantize_weights(args):
                 args.quantize_nbits
             )
 
-def _quantize_weights(out_path, model_name, nbits):
+    # Quantize architectural chunks if they exist
+    # Check if architectural chunking mode is enabled
+    is_architectural = args.unet_chunks == "architectural"
+    if is_architectural:
+        from python_coreml_stable_diffusion.unet_architectural_chunks import ARCHITECTURAL_CHUNK_NAMES
+
+        # Determine which chunks have optional ControlNet inputs
+        # AlphaEncoder: additional_residual_0 through _6, image_embeds
+        # GammaDownblock: additional_residual_7, _8
+        # SigmaCore: additional_residual_9
+        chunks_with_controlnet = {
+            "SDXLAlphaEncoderB": ["additional_residual", "image_embeds"],
+            "SDXLGammaDownblock": ["additional_residual"],
+            "SDXLSigmaCore": ["additional_residual"],
+        }
+
+        for chunk_name in ARCHITECTURAL_CHUNK_NAMES:
+            logger.info(f"Quantizing architectural chunk {chunk_name} to {args.quantize_nbits}-bit precision")
+            out_path = _get_out_path(args, chunk_name)
+            restore_inputs = chunks_with_controlnet.get(chunk_name, None)
+            _quantize_weights(
+                out_path,
+                chunk_name,
+                args.quantize_nbits,
+                restore_optional_inputs=restore_inputs
+            )
+
+def _quantize_weights(out_path, model_name, nbits, restore_optional_inputs=None):
+    """Quantize weights to nbits using palette (look-up table).
+
+    Args:
+        out_path: Path to the model
+        model_name: Name of the model for logging
+        nbits: Number of bits for quantization
+        restore_optional_inputs: List of input name prefixes to restore as optional after quantization.
+                                 Quantization loses the isOptional flag, so we need to restore it.
+    """
     if os.path.exists(out_path):
         logger.info(f"Quantizing {model_name}")
         mlmodel = ct.models.MLModel(out_path,
@@ -230,7 +280,20 @@ def _quantize_weights(out_path, model_name, nbits):
             }
         )
 
-        model = ct.optimize.coreml.palettize_weights(mlmodel, config=config).save(out_path)
+        quantized_model = ct.optimize.coreml.palettize_weights(mlmodel, config=config)
+
+        # Restore optional input flags if specified (quantization loses them)
+        if restore_optional_inputs:
+            spec = quantized_model.get_spec()
+            for input_type in spec.description.input:
+                for prefix in restore_optional_inputs:
+                    if input_type.name.startswith(prefix):
+                        input_type.type.isOptional = True
+                        logger.info(f"Restored optional flag for input: {input_type.name}")
+                        break
+            quantized_model = ct.models.MLModel(spec, weights_dir=quantized_model.weights_dir)
+
+        quantized_model.save(out_path)
         logger.info("Done")
     else:
         logger.info(
@@ -309,7 +372,17 @@ def bundle_resources_for_swift_cli(args):
                                      ("control-unet_chunk2", "ControlledUnetChunk2"),
                                      ("control-unet_chunk3", "ControlledUnetChunk3"),
                                      ("control-unet_chunk4", "ControlledUnetChunk4"),
-                                     ("safety_checker", "SafetyChecker")]:
+                                     ("safety_checker", "SafetyChecker"),
+                                     # Architectural chunks for SDXL
+                                     ("SDXLAlphaEncoderA", "SDXLAlphaEncoderA"),
+                                     ("SDXLAlphaEncoderB", "SDXLAlphaEncoderB"),
+                                     ("SDXLGammaDownblock", "SDXLGammaDownblock"),
+                                     ("SDXLSigmaCore", "SDXLSigmaCore"),
+                                     ("SDXLThetaUpblockA", "SDXLThetaUpblockA"),
+                                     ("SDXLThetaUpblockB", "SDXLThetaUpblockB"),
+                                     ("SDXLLambdaUpblock", "SDXLLambdaUpblock"),
+                                     ("SDXLKappaUpblock", "SDXLKappaUpblock"),
+                                     ("SDXLOmegaDecoder", "SDXLOmegaDecoder")]:
         source_path = _get_out_path(args, source_name)
         if os.path.exists(source_path):
             target_path = _compile_coreml_model(source_path, resources_dir,
@@ -1386,6 +1459,314 @@ def fix_optional_inputs(mlpackage_path, optional_input_names):
     else:
         logger.info(f"No optional inputs to patch in {mlpackage_path}")
 
+
+def convert_unet_architectural_chunks(pipe, args):
+    """
+    Convert UNet into architectural chunks.
+
+    This creates semantically meaningful chunks that split the UNet along
+    architectural boundaries rather than by weight size.
+    """
+    from python_coreml_stable_diffusion.unet_architectural_chunks import (
+        ARCHITECTURAL_CHUNK_NAMES,
+        ARCHITECTURAL_CHUNK_CLASSES,
+        get_architectural_chunk_output_names,
+    )
+
+    # Check if all chunks already exist
+    all_exist = all(
+        os.path.exists(_get_out_path(args, chunk_name))
+        for chunk_name in ARCHITECTURAL_CHUNK_NAMES
+    )
+    if all_exist:
+        logger.info("All architectural UNet chunks already exist, skipping conversion.")
+        return
+
+    # Build reference UNet
+    logger.info("Building reference UNet for architectural chunking...")
+
+    batch_size = 1 if args.unet_batch_one else 2
+    latent_h = args.latent_h or pipe.unet.config.sample_size
+    latent_w = args.latent_w or pipe.unet.config.sample_size
+
+    reference_unet = unet.UNet2DConditionModelXL(
+        support_controlnet=args.unet_support_controlnet,
+        support_image_prompt=(pipe.image_encoder is not None),
+        encoder_hid_proj_reference=pipe.unet.encoder_hid_proj,
+        **pipe.unet.config
+    ).eval()
+
+    # Hook in additional scales for the IP-Adapter
+    if args.load_ip_adapter:
+        try:
+            ip_scales = json.loads(args.ip_scales)
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON passed to --ip_scales")
+
+        if isinstance(ip_scales, dict):
+            ip_scales = [ip_scales]
+
+        _set_ip_adapter_additional_scales(reference_unet, ip_scales)
+
+    load_state_dict_summary = reference_unet.load_state_dict(pipe.unet.state_dict())
+    logger.info(f"Loaded UNet state dict: {load_state_dict_summary}")
+
+    # Common sample inputs
+    height = latent_h * 8
+    width = latent_w * 8
+
+    # Text encoder hidden size
+    if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+        text_hidden_size = args.text_encoder_hidden_size or pipe.unet.config.cross_attention_dim or pipe.text_encoder_2.config.hidden_size
+        text_token_length = args.text_token_sequence_length or pipe.text_encoder_2.config.max_position_embeddings
+        pooled_text_dim = pipe.text_encoder_2.config.hidden_size
+    else:
+        text_hidden_size = args.text_encoder_hidden_size or pipe.unet.config.cross_attention_dim or 2048
+        text_token_length = args.text_token_sequence_length or 77
+        pooled_text_dim = 1280
+
+    # Generate sample inputs for each chunk and convert
+    for chunk_name in ARCHITECTURAL_CHUNK_NAMES:
+        out_path = _get_out_path(args, chunk_name)
+
+        if os.path.exists(out_path):
+            logger.info(f"Skipping {chunk_name}, already exists at {out_path}")
+            continue
+
+        logger.info(f"Converting {chunk_name}...")
+
+        # Create chunk wrapper
+        chunk_class = ARCHITECTURAL_CHUNK_CLASSES[chunk_name]
+        chunk_module = chunk_class(reference_unet).eval()
+
+        # Generate sample inputs based on chunk type
+        sample_inputs = _get_architectural_chunk_sample_inputs(
+            chunk_name, batch_size, latent_h, latent_w,
+            text_hidden_size, text_token_length, pooled_text_dim,
+            pipe.image_encoder, args
+        )
+
+        sample_inputs_spec = {k: (v.shape, v.dtype) for k, v in sample_inputs.items()}
+        logger.info(f"Sample inputs for {chunk_name}: {sample_inputs_spec}")
+
+        # JIT trace
+        logger.info(f"JIT tracing {chunk_name}...")
+        traced_chunk = torch.jit.trace(chunk_module, list(sample_inputs.values()))
+        logger.info("Done.")
+
+        # Convert to CoreML
+        coreml_sample_inputs = {
+            k: v.numpy().astype(np.float16) if v.dtype == torch.float32 else v.numpy()
+            for k, v in sample_inputs.items()
+        }
+
+        output_names = get_architectural_chunk_output_names(chunk_name, reference_unet)
+
+        coreml_chunk, _ = _convert_to_coreml(
+            chunk_name,
+            traced_chunk,
+            coreml_sample_inputs,
+            output_names,
+            args,
+            out_path=out_path,
+        )
+
+        # Make ControlNet additional_residual inputs optional (if defined)
+        if args.unet_support_controlnet:
+            spec = coreml_chunk.get_spec()
+            for input_type in spec.description.input:
+                if input_type.name.startswith("additional_residual"):
+                    input_type.type.isOptional = True
+            coreml_chunk = ct.models.MLModel(spec, weights_dir=coreml_chunk.weights_dir)
+
+        # Set metadata
+        coreml_chunk.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
+        coreml_chunk.license = "OpenRAIL++-M (https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md)"
+        coreml_chunk.version = args.model_version
+        coreml_chunk.short_description = f"SDXL UNet {chunk_name} - Architectural chunk for on-device inference"
+
+        # Set package version metadata
+        from python_coreml_stable_diffusion._version import __version__
+        coreml_chunk.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
+        coreml_chunk.user_defined_metadata["chunk_type"] = "architectural"
+        coreml_chunk.user_defined_metadata["chunk_name"] = chunk_name
+
+        coreml_chunk.save(out_path)
+        logger.info(f"Saved {chunk_name} to {out_path}")
+
+        del traced_chunk, coreml_chunk, chunk_module
+        gc.collect()
+
+    logger.info("Architectural UNet chunking complete.")
+
+
+def _get_architectural_chunk_sample_inputs(
+    chunk_name, batch_size, latent_h, latent_w,
+    text_hidden_size, text_token_length, pooled_text_dim,
+    image_encoder, args
+):
+    """Generate sample inputs for each architectural chunk."""
+
+    # Common tensor shapes
+    # For SDXL, encoder_hidden_states is [B, hidden, 1, seq_len] due to conv format
+    encoder_hidden_states_shape = (batch_size, text_hidden_size, 1, text_token_length)
+    # emb is the time embedding, output from AlphaEncoder as [B, 1280, 1, 1] for conv compatibility
+    emb_shape = (batch_size, 1280, 1, 1)
+    # ip_hidden_states shape: [B, cross_attention_dim, 1, num_ip_tokens]
+    # For IP-Adapter Plus, num_ip_tokens is typically 16
+    ip_hidden_states_shape = (batch_size, text_hidden_size, 1, 16) if image_encoder is not None else None
+
+    # Spatial dimensions at different resolutions
+    h, w = latent_h, latent_w  # Full resolution (e.g., 96)
+    h2, w2 = latent_h // 2, latent_w // 2  # Half (e.g., 48)
+    h4, w4 = latent_h // 4, latent_w // 4  # Quarter (e.g., 24)
+    h8, w8 = latent_h // 8, latent_w // 8  # Eighth (e.g., 12)
+
+    # ControlNet support flag
+    support_controlnet = getattr(args, 'unet_support_controlnet', False)
+
+    if chunk_name == "SDXLAlphaEncoderA":
+        # Time embedding computation only - minimal inputs
+        inputs = OrderedDict([
+            ("timestep", torch.tensor([1000.0] * batch_size).float()),
+            ("time_ids", torch.rand(batch_size, 6)),
+            ("text_embeds", torch.rand(batch_size, pooled_text_dim)),
+        ])
+        return inputs
+
+    elif chunk_name == "SDXLAlphaEncoderB":
+        # IP-Adapter + conv_in + down_blocks[0,1]
+        inputs = OrderedDict([
+            ("sample", torch.rand(batch_size, 4, h, w)),
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+        ])
+        # Add IP-Adapter inputs if enabled
+        if image_encoder is not None:
+            image_enc_cfg = image_encoder.config
+            mode = _determine_image_encoder_output_mode(image_encoder)
+            if mode == "hidden_states":
+                H, W = image_enc_cfg.image_size, image_enc_cfg.image_size
+                P = image_enc_cfg.patch_size
+                D = image_enc_cfg.hidden_size
+                num_patches = (H // P) * (W // P)
+                image_embeds_shape = (batch_size, num_patches + 1, D)
+            else:
+                image_embeds_shape = (batch_size, 1, image_enc_cfg.projection_dim)
+            inputs["image_embeds"] = torch.rand(*image_embeds_shape)
+            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+        # Add ControlNet residual inputs if enabled
+        # AlphaEncoderB handles: conv_in (0) + down_blocks[0] (1,2,3) + down_blocks[1] (4,5,6)
+        if support_controlnet:
+            inputs["additional_residual_0"] = torch.rand(batch_size, 320, h, w)    # conv_in
+            inputs["additional_residual_1"] = torch.rand(batch_size, 320, h, w)    # down_blocks[0].resnets[0]
+            inputs["additional_residual_2"] = torch.rand(batch_size, 320, h, w)    # down_blocks[0].resnets[1]
+            inputs["additional_residual_3"] = torch.rand(batch_size, 320, h2, w2)  # down_blocks[0].downsampler
+            inputs["additional_residual_4"] = torch.rand(batch_size, 640, h2, w2)  # down_blocks[1].resnets[0]
+            inputs["additional_residual_5"] = torch.rand(batch_size, 640, h2, w2)  # down_blocks[1].resnets[1]
+            inputs["additional_residual_6"] = torch.rand(batch_size, 640, h4, w4)  # down_blocks[1].downsampler
+        return inputs
+
+    elif chunk_name == "SDXLGammaDownblock":
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, 640, h4, w4)),
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+        ])
+        if image_encoder is not None:
+            inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
+            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+        # Add ControlNet residual inputs if enabled
+        # GammaDownblock handles: down_blocks[2] (7,8) - no downsampler
+        if support_controlnet:
+            inputs["additional_residual_7"] = torch.rand(batch_size, 1280, h4, w4)  # down_blocks[2].resnets[0]
+            inputs["additional_residual_8"] = torch.rand(batch_size, 1280, h4, w4)  # down_blocks[2].resnets[1]
+        return inputs
+
+    elif chunk_name == "SDXLSigmaCore":
+        # Note: down_blocks[2] has NO downsampler in SDXL, so spatial dims stay at h4, w4
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, 1280, h4, w4)),  # from GammaDownblock (no downsampler)
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+        ])
+        if image_encoder is not None:
+            inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
+            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+        # Add ControlNet residual input if enabled
+        # SigmaCore handles: mid_block (9) - same spatial dims as hidden
+        if support_controlnet:
+            inputs["additional_residual_9"] = torch.rand(batch_size, 1280, h4, w4)  # mid_block
+        return inputs
+
+    elif chunk_name == "SDXLThetaUpblockA":
+        # First layer of up_blocks[0]: ResNet0 + Attention0
+        # Takes hidden from SigmaCore and skip_0 from down_blocks[2] resnet 1 (skip_down2_1)
+        # Skip connections are consumed in REVERSE order within each up_block
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, 1280, h4, w4)),  # from SigmaCore (mid_block)
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+            ("ip_hidden_states", torch.rand(*ip_hidden_states_shape) if image_encoder is not None else torch.zeros(batch_size, text_hidden_size, 1, 16)),
+            ("skip_0", torch.rand(batch_size, 1280, h4, w4)),  # from down_blocks[2] resnet 1 (skip_down2_1)
+        ])
+        if image_encoder is not None:
+            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+        return inputs
+
+    elif chunk_name == "SDXLThetaUpblockB":
+        # Remaining layers of up_blocks[0]: ResNet1 + Attention1 + ResNet2 + Attention2 + Upsampler
+        # Takes hidden from ThetaUpblockA, skip_0 from down_blocks[2] resnet 0, skip_1 from down_blocks[1] downsampler
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, 1280, h4, w4)),  # from ThetaUpblockA
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+            ("ip_hidden_states", torch.rand(*ip_hidden_states_shape) if image_encoder is not None else torch.zeros(batch_size, text_hidden_size, 1, 16)),
+            ("skip_0", torch.rand(batch_size, 1280, h4, w4)),  # from down_blocks[2] resnet 0 (skip_down2_0)
+            ("skip_1", torch.rand(batch_size, 640, h4, w4)),   # from down_blocks[1] downsampler (skip_down1_2)
+        ])
+        if image_encoder is not None:
+            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+        return inputs
+
+    elif chunk_name == "SDXLLambdaUpblock":
+        # CrossAttnUpBlock2D (up_blocks[1]) - needs encoder_hidden_states
+        # Consumes skips: skip[5]=[640, H/2, W/2], skip[4]=[640, H/2, W/2], skip[3]=[320, H/2, W/2]
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, 1280, h2, w2)),  # from ThetaUpblockB (upsampled)
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+            ("ip_hidden_states", torch.rand(*ip_hidden_states_shape) if image_encoder is not None else torch.zeros(batch_size, text_hidden_size, 1, 16)),
+            ("skip_0", torch.rand(batch_size, 640, h2, w2)),   # skip[5] from down_blocks[1] resnet 1
+            ("skip_1", torch.rand(batch_size, 640, h2, w2)),   # skip[4] from down_blocks[1] resnet 0
+            ("skip_2", torch.rand(batch_size, 320, h2, w2)),   # skip[3] from down_blocks[0] downsampler
+        ])
+        if image_encoder is not None:
+            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+        return inputs
+
+    elif chunk_name == "SDXLKappaUpblock":
+        # UpBlock2D (up_blocks[2]) - no encoder_hidden_states needed
+        # Consumes skips: skip[2]=[320, H, W], skip[1]=[320, H, W], skip[0]=[320, H, W]
+        return OrderedDict([
+            ("hidden", torch.rand(batch_size, 640, h, w)),     # from LambdaUpblock (upsampled)
+            ("emb", torch.rand(*emb_shape)),
+            ("skip_0", torch.rand(batch_size, 320, h, w)),     # skip[2] from down_blocks[0] resnet 1
+            ("skip_1", torch.rand(batch_size, 320, h, w)),     # skip[1] from down_blocks[0] resnet 0
+            ("skip_2", torch.rand(batch_size, 320, h, w)),     # skip[0] from conv_in
+        ])
+
+    elif chunk_name == "SDXLOmegaDecoder":
+        # Only conv_norm_out + conv_act + conv_out
+        return OrderedDict([
+            ("hidden", torch.rand(batch_size, 320, h, w)),
+            ("skip_conv_in", torch.rand(batch_size, 320, h, w)),
+        ])
+
+    else:
+        raise ValueError(f"Unknown chunk name: {chunk_name}")
+
+
 def chunk_unet(args, model_name=None):
     """ Chunks the UNet component of Stable Diffusion
     """
@@ -2048,9 +2429,15 @@ def main(args):
         logger.info("Converted controlnet")
         
     if args.convert_unet:
-        logger.info("Converting unet")
-        convert_unet(pipe, args)
-        logger.info("Converted unet")
+        # Check if we should use architectural chunking (requires pipe access)
+        if args.unet_chunks == "architectural":
+            logger.info("Converting unet with architectural chunking")
+            convert_unet_architectural_chunks(pipe, args)
+            logger.info("Converted unet with architectural chunking")
+        else:
+            logger.info("Converting unet")
+            convert_unet(pipe, args)
+            logger.info("Converted unet")
 
     if args.convert_text_encoder and hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
         logger.info("Converting text_encoder")
@@ -2099,15 +2486,27 @@ def main(args):
         logger.info(f"Quantized weights to {args.quantize_nbits}-bit precision")
 
     if args.unet_chunks is not None:
-        logger.info("Chunking unet")
-        chunk_unet(args)
-        logger.info("Chunking unet")
+        # Skip if architectural chunking was already done during convert_unet
+        if args.unet_chunks == "architectural":
+            logger.info("Skipping chunk_unet (architectural chunking was done during conversion)")
+        else:
+            logger.info("Chunking unet")
+            chunk_unet(args)
+            logger.info("Chunked unet")
 
     if args.bundle_resources_for_swift_cli:
         logger.info("Bundling resources for the Swift CLI")
         bundle_resources_for_swift_cli(args)
         logger.info("Bundled resources for the Swift CLI")
 
+def unet_chunks_type(value):
+    if value in {"2", "4"}:
+        return int(value)
+    if value == "architectural":
+        return value
+    raise argparse.ArgumentTypeError(
+        "Must be 2, 4, or 'architectural'"
+    )
 
 def parser_spec():
     parser = argparse.ArgumentParser()
@@ -2235,12 +2634,14 @@ def parser_spec():
     parser.add_argument(
         "--unet-chunks",
         default=None,
-        choices=(2, 4),
-        type=int,
-        help=
-        "If specified, generates mlpackages out of the unet model which approximately equal weights sizes."
+        type=unet_chunks_type,
+        help=(
+        "If specified, generates mlpackages out of the unet model. "
+        "2/4: approximately equal weight chunks (for ANE). "
+        "architectural: Architectural chunks with explicit skip connections for SDXL. "
         "This is required for ANE deployment on iOS and iPadOS. Not required for macOS."
-        )
+        ),
+    )
     parser.add_argument(
         "--quantize-nbits",
         default=None,
