@@ -1,5 +1,6 @@
 // For licensing see accompanying LICENSE.md file.
 // Copyright (C) 2023 Apple Inc. All Rights Reserved.
+// Copyright (C) 2026 Digital Masterpieces GmbH. All Rights Reserved.
 
 import Accelerate
 import CoreGraphics
@@ -515,7 +516,18 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                     converting: random.normalShapedArray(sampleShape, mean: 0.0, stdev: Double(stdev)))
             }
 
-            let latent = try encoder.encode(image, scaleFactor: config.encoderScaleFactor, random: &random)
+            // Use tiled encoding if configured (enables Neural Engine on memory-constrained devices)
+            let latent: MLShapedArray<Float32>
+            if config.tilingConfig.enabled {
+                latent = try encoder.encodeTiled(
+                    image,
+                    scaleFactor: config.encoderScaleFactor,
+                    random: &random,
+                    tilingConfig: config.tilingConfig
+                )
+            } else {
+                latent = try encoder.encode(image, scaleFactor: config.encoderScaleFactor, random: &random)
+            }
             if let scheduler = scheduler as? DiscreteEulerScheduler {
                 return scheduler.addNoise(originalSample: latent, noise: samples, timeStep: nil)
             } else {
@@ -537,8 +549,18 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 decoder.unloadResources()
             }
         }
-        
-        return try decoder.decode(latents, scaleFactor: config.decoderScaleFactor)
+
+        // Use tiled decoding if configured (enables Neural Engine on memory-constrained devices)
+        if config.tilingConfig.enabled {
+            return try decoder.decodeTiled(
+                latents,
+                scaleFactor: config.decoderScaleFactor,
+                shiftFactor: config.decoderShiftFactor,
+                tilingConfig: config.tilingConfig
+            )
+        } else {
+            return try decoder.decode(latents, scaleFactor: config.decoderScaleFactor)
+        }
     }
 
     struct ModelInputs {

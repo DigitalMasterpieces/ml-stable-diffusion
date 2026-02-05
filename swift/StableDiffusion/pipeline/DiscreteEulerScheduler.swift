@@ -1,3 +1,6 @@
+// For licensing see accompanying LICENSE.md file.
+// Copyright (C) 2026 Digital Masterpieces GmbH. All Rights Reserved.
+
 import Accelerate
 import CoreML
 

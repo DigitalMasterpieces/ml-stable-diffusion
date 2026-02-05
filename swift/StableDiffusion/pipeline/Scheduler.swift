@@ -1,5 +1,6 @@
 // For licensing see accompanying LICENSE.md file.
 // Copyright (C) 2022 Apple Inc. All Rights Reserved.
+// Copyright (C) 2026 Digital Masterpieces GmbH. All Rights Reserved.
 
 import Accelerate
 import CoreML

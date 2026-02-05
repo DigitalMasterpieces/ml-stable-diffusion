@@ -841,10 +841,12 @@ def modify_coremltools_torch_frontend_badbmm():
 def convert_vae_decoder(pipe, args):
     """ Converts the VAE Decoder component of Stable Diffusion
     """
-    out_path = _get_out_path(args, "vae_decoder")
+    # Determine output name based on tiled mode
+    model_name = "VAEDecoderTiled" if args.vae_tiled else "vae_decoder"
+    out_path = _get_out_path(args, model_name)
     if os.path.exists(out_path):
         logger.info(
-            f"`vae_decoder` already exists at {out_path}, skipping conversion."
+            f"`{model_name}` already exists at {out_path}, skipping conversion."
         )
         return
 
@@ -853,22 +855,37 @@ def convert_vae_decoder(pipe, args):
             "convert_unet() deletes pipe.unet to save RAM. "
             "Please use convert_vae_decoder() before convert_unet()")
 
+    # Determine latent dimensions
+    if args.vae_tiled:
+        # Use tile size for tiled VAE (default 64x64 latent = 512x512 image)
+        latent_h = args.vae_tile_latent_size
+        latent_w = args.vae_tile_latent_size
+        logger.info(f"Converting VAE decoder for tiled processing: {latent_h}x{latent_w} latent ({latent_h*8}x{latent_w*8} image)")
+    else:
+        latent_h = args.latent_h or pipe.unet.config.sample_size
+        latent_w = args.latent_w or pipe.unet.config.sample_size
+
     z_shape = (
         1,  # B
         pipe.vae.config.latent_channels,  # C
-        args.latent_h or pipe.unet.config.sample_size,  # H
-        args.latent_w or pipe.unet.config.sample_size,  # W
+        latent_h,  # H
+        latent_w,  # W
     )
 
     if args.custom_vae_version is None and args.xl_version:
         inputs_dtype = torch.float32
         compute_precision = ct.precision.FLOAT32
-        # FIXME: Hardcoding to CPU_AND_GPU since ANE doesn't support FLOAT32
-        compute_unit = ct.ComputeUnit.CPU_AND_GPU
+        if args.vae_tiled:
+            # Tiled VAE can use Neural Engine since tiles are small enough
+            compute_unit = ct.ComputeUnit.ALL
+            logger.info("Tiled VAE decoder will use ALL compute units (including Neural Engine)")
+        else:
+            # FIXME: Hardcoding to CPU_AND_GPU since ANE doesn't support FLOAT32 at full resolution
+            compute_unit = ct.ComputeUnit.CPU_AND_GPU
     else:
         inputs_dtype = torch.float16
         compute_precision = None
-        compute_unit = None
+        compute_unit = ct.ComputeUnit.ALL if args.vae_tiled else None
 
     sample_vae_decoder_inputs = {
         "z": torch.rand(*z_shape, dtype=inputs_dtype)
@@ -894,7 +911,7 @@ def convert_vae_decoder(pipe, args):
 
     modify_coremltools_torch_frontend_badbmm()
     coreml_vae_decoder, out_path = _convert_to_coreml(
-        "vae_decoder", traced_vae_decoder, sample_vae_decoder_inputs,
+        model_name, traced_vae_decoder, sample_vae_decoder_inputs,
         ["image"], args, precision=compute_precision, compute_unit=compute_unit)
 
     # Set model metadata
@@ -916,9 +933,16 @@ def convert_vae_decoder(pipe, args):
     coreml_vae_decoder.output_description[
         "image"] = "Generated image normalized to range [-1, 1]"
 
+    # Update description for tiled mode
+    if args.vae_tiled:
+        coreml_vae_decoder.short_description = \
+            f"Tiled VAE Decoder for Stable Diffusion ({args.vae_tile_latent_size}x{args.vae_tile_latent_size} latent tiles). " \
+            "Use with TilingConfiguration in Swift for Neural Engine execution at high resolutions. " \
+            "Please refer to https://arxiv.org/abs/2112.10752 for details."
+
     coreml_vae_decoder.save(out_path)
 
-    logger.info(f"Saved vae_decoder into {out_path}")
+    logger.info(f"Saved {model_name} into {out_path}")
 
     # Parity check PyTorch vs CoreML
     if args.check_output_correctness:
@@ -929,7 +953,7 @@ def convert_vae_decoder(pipe, args):
                 {k: v.numpy()
                  for k, v in sample_vae_decoder_inputs.items()}).values())[0]
         report_correctness(baseline_out, coreml_out,
-                           "vae_decoder baseline PyTorch to baseline CoreML")
+                           f"{model_name} baseline PyTorch to baseline CoreML")
 
     del traced_vae_decoder, pipe.vae.decoder, coreml_vae_decoder
     gc.collect()
@@ -993,10 +1017,12 @@ def convert_vae_decoder_sd3(args):
 def convert_vae_encoder(pipe, args):
     """ Converts the VAE Encoder component of Stable Diffusion
     """
-    out_path = _get_out_path(args, "vae_encoder")
+    # Determine output name based on tiled mode
+    model_name = "VAEEncoderTiled" if args.vae_tiled else "vae_encoder"
+    out_path = _get_out_path(args, model_name)
     if os.path.exists(out_path):
         logger.info(
-            f"`vae_encoder` already exists at {out_path}, skipping conversion."
+            f"`{model_name}` already exists at {out_path}, skipping conversion."
         )
         return
 
@@ -1004,10 +1030,17 @@ def convert_vae_encoder(pipe, args):
         raise RuntimeError(
             "convert_unet() deletes pipe.unet to save RAM. "
             "Please use convert_vae_encoder() before convert_unet()")
-    
-    height = (args.latent_h or pipe.unet.config.sample_size) * 8
-    width = (args.latent_w or pipe.unet.config.sample_size) * 8
-    
+
+    # Determine image dimensions
+    if args.vae_tiled:
+        # Use tile size for tiled VAE (default 64x64 latent = 512x512 image)
+        height = args.vae_tile_latent_size * 8
+        width = args.vae_tile_latent_size * 8
+        logger.info(f"Converting VAE encoder for tiled processing: {height}x{width} image ({args.vae_tile_latent_size}x{args.vae_tile_latent_size} latent)")
+    else:
+        height = (args.latent_h or pipe.unet.config.sample_size) * 8
+        width = (args.latent_w or pipe.unet.config.sample_size) * 8
+
     x_shape = (
         1,  # B
         3,  # C (RGB range from -1 to 1)
@@ -1018,12 +1051,17 @@ def convert_vae_encoder(pipe, args):
     if args.custom_vae_version is None and args.xl_version:
         inputs_dtype = torch.float32
         compute_precision = ct.precision.FLOAT32
-        # FIXME: Hardcoding to CPU_AND_GPU since ANE doesn't support FLOAT32
-        compute_unit = ct.ComputeUnit.CPU_AND_GPU
+        if args.vae_tiled:
+            # Tiled VAE can use Neural Engine since tiles are small enough
+            compute_unit = ct.ComputeUnit.ALL
+            logger.info("Tiled VAE encoder will use ALL compute units (including Neural Engine)")
+        else:
+            # FIXME: Hardcoding to CPU_AND_GPU since ANE doesn't support FLOAT32 at full resolution
+            compute_unit = ct.ComputeUnit.CPU_AND_GPU
     else:
         inputs_dtype = torch.float16
         compute_precision = None
-        compute_unit = None
+        compute_unit = ct.ComputeUnit.ALL if args.vae_tiled else None
 
     sample_vae_encoder_inputs = {
         "x": torch.rand(*x_shape, dtype=inputs_dtype)
@@ -1049,7 +1087,7 @@ def convert_vae_encoder(pipe, args):
 
     modify_coremltools_torch_frontend_badbmm()
     coreml_vae_encoder, out_path = _convert_to_coreml(
-        "vae_encoder", traced_vae_encoder, sample_vae_encoder_inputs,
+        model_name, traced_vae_encoder, sample_vae_encoder_inputs,
         ["latent"], args, precision=compute_precision, compute_unit=compute_unit)
 
     # Set model metadata
@@ -1070,9 +1108,16 @@ def convert_vae_encoder(pipe, args):
     # Set the output descriptions
     coreml_vae_encoder.output_description["latent"] = "The latent embeddings from the unet model from the input image."
 
+    # Update description for tiled mode
+    if args.vae_tiled:
+        coreml_vae_encoder.short_description = \
+            f"Tiled VAE Encoder for Stable Diffusion ({args.vae_tile_latent_size * 8}x{args.vae_tile_latent_size * 8} image tiles). " \
+            "Use with TilingConfiguration in Swift for Neural Engine execution at high resolutions. " \
+            "Please refer to https://arxiv.org/abs/2112.10752 for details."
+
     coreml_vae_encoder.save(out_path)
 
-    logger.info(f"Saved vae_encoder into {out_path}")
+    logger.info(f"Saved {model_name} into {out_path}")
 
     # Parity check PyTorch vs CoreML
     if args.check_output_correctness:
@@ -1083,7 +1128,7 @@ def convert_vae_encoder(pipe, args):
                 {k: v.numpy()
                  for k, v in sample_vae_encoder_inputs.items()}).values())[0]
         report_correctness(baseline_out, coreml_out,
-                           "vae_encoder baseline PyTorch to baseline CoreML")
+                           f"{model_name} baseline PyTorch to baseline CoreML")
 
     del traced_vae_encoder, pipe.vae.encoder, coreml_vae_encoder
     gc.collect()
@@ -2717,6 +2762,19 @@ def parser_spec():
         "--sd3-version",
         action="store_true",
         help=("If specified, the pre-trained model will be treated as an SD3 model."))
+    parser.add_argument(
+        "--vae-tiled",
+        action="store_true",
+        help=("If specified, converts VAE encoder/decoder for tiled processing with 64x64 latent "
+              "(512x512 image) tiles. This enables Neural Engine execution on memory-constrained "
+              "devices like iPhone 14 Pro at high resolutions (1024x1024). The output models will "
+              "have 'Tiled' suffix in their names. Use with the TilingConfiguration in Swift."))
+    parser.add_argument(
+        "--vae-tile-latent-size",
+        type=int,
+        default=64,
+        help=("Latent tile size for tiled VAE conversion. Default is 64 (512x512 image tiles). "
+              "Only used when --vae-tiled is specified."))
 
     return parser
 

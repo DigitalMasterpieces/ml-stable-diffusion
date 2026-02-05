@@ -1,5 +1,6 @@
 // For licensing see accompanying LICENSE.md file.
 // Copyright (C) 2022 Apple Inc. All Rights Reserved.
+// Copyright (C) 2026 Digital Masterpieces GmbH. All Rights Reserved.
 
 import Foundation
 import CoreGraphics
@@ -78,6 +79,11 @@ public struct PipelineConfiguration: Hashable {
     public var aestheticScore: Float32 = 6
     /// Can be used to simulate an aesthetic score of the generated image by influencing the negative text condition.
     public var negativeAestheticScore: Float32 = 2.5
+
+    /// Configuration for tiled VAE processing (encoder/decoder)
+    /// Enable this to use Neural Engine for VAE operations at high resolutions (1024x1024)
+    /// ⚠️ The correct input and output shapes need to be configured with the encoder/decoder models when using tiling.
+    public var tilingConfig: TilingConfiguration = .disabled
 
     /// Given the configuration, what mode will be used for generation
     public var mode: PipelineMode {

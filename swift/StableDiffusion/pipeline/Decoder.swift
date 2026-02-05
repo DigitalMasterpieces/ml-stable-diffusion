@@ -1,5 +1,6 @@
 // For licensing see accompanying LICENSE.md file.
 // Copyright (C) 2024 Apple Inc. All Rights Reserved.
+// Copyright (C) 2026 Digital Masterpieces GmbH. All Rights Reserved.
 
 import Foundation
 import CoreML
@@ -79,6 +80,112 @@ public struct Decoder: ResourceManaging {
             let outputName = result.featureNames.first!
             let output = result.featureValue(for: outputName)!.multiArrayValue!
             return try CGImage.fromShapedArray(MLShapedArray<Float32>(converting: output))
+        }
+
+        return images
+    }
+
+    /// Batch decode latent samples into images using tiled processing
+    ///
+    /// This method processes latents in tiles to reduce memory usage,
+    /// enabling Neural Engine execution on devices with memory constraints.
+    ///
+    ///  - Parameters:
+    ///    - latents: Batch of latent samples to decode
+    ///    - scaleFactor: scalar divisor on latents before decoding
+    ///    - shiftFactor: shift factor for latent preprocessing
+    ///    - tilingConfig: Configuration for tile-based processing
+    ///  - Returns: decoded images
+    public func decodeTiled(
+        _ latents: [MLShapedArray<Float32>],
+        scaleFactor: Float32,
+        shiftFactor: Float32 = 0.0,
+        tilingConfig: TilingConfiguration
+    ) throws -> [CGImage] {
+        // If tiling disabled, use standard decoding
+        if !tilingConfig.enabled {
+            return try decode(latents, scaleFactor: scaleFactor, shiftFactor: shiftFactor)
+        }
+
+        var images: [CGImage] = []
+
+        for latent in latents {
+            // Scale latent first (before tiling)
+            let sampleScaled = MLShapedArray<Float32>(
+                scalars: latent.scalars.map { $0 / scaleFactor + shiftFactor },
+                shape: latent.shape
+            )
+
+            let latentHeight = latent.shape[2]
+            let latentWidth = latent.shape[3]
+            let imageHeight = latentHeight * 8
+            let imageWidth = latentWidth * 8
+
+            // Check if tiling is actually needed
+            if latentHeight <= tilingConfig.latentTileSize &&
+               latentWidth <= tilingConfig.latentTileSize {
+                // Process without tiling
+                let dict = [inputName: MLMultiArray(sampleScaled)]
+                let input = try MLDictionaryFeatureProvider(dictionary: dict)
+                let result = try model.perform { model in
+                    try model.prediction(from: input)
+                }
+                let outputName = result.featureNames.first!
+                let output = result.featureValue(for: outputName)!.multiArrayValue!
+                let image = try CGImage.fromShapedArray(MLShapedArray<Float32>(converting: output))
+                images.append(image)
+                continue
+            }
+
+            // Generate tile grid
+            let grid = TilingUtils.generateTileGrid(
+                latentHeight: latentHeight,
+                latentWidth: latentWidth,
+                config: tilingConfig
+            )
+
+            // Process each tile
+            var decodedTiles: [[MLShapedArray<Float32>]] = []
+
+            for row in grid {
+                var decodedRow: [MLShapedArray<Float32>] = []
+
+                for tileInfo in row {
+                    // Extract latent tile from the already-scaled latent
+                    let latentTile = TilingUtils.extractLatentTile(
+                        from: sampleScaled,
+                        tile: tileInfo
+                    )
+
+                    // Run VAE decoder on tile
+                    let dict = [inputName: MLMultiArray(latentTile)]
+                    let input = try MLDictionaryFeatureProvider(dictionary: dict)
+
+                    let result = try model.perform { model in
+                        try model.prediction(from: input)
+                    }
+
+                    let outputName = result.featureNames.first!
+                    let output = result.featureValue(for: outputName)!.multiArrayValue!
+                    let imageTile = MLShapedArray<Float32>(converting: output)
+
+                    decodedRow.append(imageTile)
+                }
+                decodedTiles.append(decodedRow)
+            }
+
+            // Stitch image tiles together with blending
+            let stitchedImage = TilingUtils.stitchImageTiles(
+                tiles: decodedTiles,
+                grid: grid,
+                config: tilingConfig,
+                outputHeight: imageHeight,
+                outputWidth: imageWidth
+            )
+
+            // Convert to CGImage
+            let cgImage = try CGImage.fromShapedArray(stitchedImage)
+            images.append(cgImage)
         }
 
         return images
