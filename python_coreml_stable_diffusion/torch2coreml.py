@@ -5,7 +5,8 @@
 #
 
 from python_coreml_stable_diffusion import (
-    unet, controlnet, controlnetunion, chunk_mlprogram, unet_architectural_chunks
+    unet, controlnet, controlnetunion, chunk_mlprogram, unet_architectural_chunks,
+    controlnetunion_architectural_chunks
 )
 
 from python_coreml_stable_diffusion.unet import AttnProcessor2_0, IPAdapterAttnProcessor2_0, UNet2DConditionModelXLWithoutIPAdapter
@@ -252,6 +253,36 @@ def quantize_weights(args):
                 args.quantize_nbits,
                 restore_optional_inputs=restore_inputs
             )
+
+    # Quantize ControlNet Union architectural chunks if they exist
+    if args.controlnet_chunk_mode == "architectural" and args.convert_controlnet:
+        from python_coreml_stable_diffusion.controlnetunion_architectural_chunks import (
+            CONTROLNET_UNION_CHUNK_NAMES
+        )
+
+        # BetaCondFusion has optional controlnet_cond inputs that need restoration
+        # The controlnet_cond_0 through controlnet_cond_N inputs are optional
+        chunks_with_optional = {
+            "ControlNetBetaCondFusion": ["controlnet_cond"],
+        }
+
+        for controlnet_version in args.convert_controlnet:
+            controlnet_model_name = controlnet_version.replace("/", "_")
+
+            for chunk_name in CONTROLNET_UNION_CHUNK_NAMES:
+                logger.info(f"Quantizing ControlNet Union chunk {chunk_name} to {args.quantize_nbits}-bit precision")
+                # Chunk naming pattern: ControlNet_{model_name}_{chunk_name}.mlpackage
+                fname = f"ControlNet_{controlnet_model_name}_{chunk_name}.mlpackage"
+                out_path = os.path.join(args.o, fname)
+
+                restore_inputs = chunks_with_optional.get(chunk_name)
+
+                _quantize_weights(
+                    out_path,
+                    f"{controlnet_model_name}_{chunk_name}",
+                    args.quantize_nbits,
+                    restore_optional_inputs=restore_inputs
+                )
 
 def _quantize_weights(out_path, model_name, nbits, restore_optional_inputs=None):
     """Quantize weights to nbits using palette (look-up table).
@@ -2397,6 +2428,310 @@ def convert_controlnet(pipe, args):
         del coreml_controlnet
         gc.collect()
 
+
+def _get_controlnet_union_chunk_sample_inputs(
+    chunk_name, batch_size, latent_h, latent_w,
+    text_hidden_size, text_token_length, num_control_type,
+    controlnet=None
+):
+    """Generate sample inputs for each ControlNet Union architectural chunk (6-chunk architecture).
+
+    This 6-chunk architecture is designed for ControlNet Union ProMax which has 3 down_blocks
+    (not 4 like standard SDXL). Total of 10 residual outputs (additional_residual_0 through _9).
+
+    DeltaDown2 is split into DeltaDown2A and DeltaDown2B at the resnet boundary to reduce
+    chunk size from ~1.5GB to ~750MB each.
+    """
+    from python_coreml_stable_diffusion.controlnetunion_architectural_chunks import CONTROLNET_UNION_CHUNK_NAMES
+
+    # For SDXL, encoder_hidden_states is [B, hidden, 1, seq_len] due to conv format
+    encoder_hidden_states_shape = (batch_size, text_hidden_size, 1, text_token_length)
+    # emb is [B, 1280, 1, 1] time embedding (4D for Conv2d compatibility)
+    emb_shape = (batch_size, 1280, 1, 1)
+
+    # Get block_out_channels from controlnet config if available
+    if controlnet is not None:
+        block_out_channels = controlnet.config.block_out_channels
+        num_down_blocks = len(controlnet.down_blocks)
+    else:
+        block_out_channels = (320, 640, 1280)  # Default for 3-down-block ControlNet Union
+        num_down_blocks = 3
+
+    # Spatial dimensions at different resolutions
+    h, w = latent_h, latent_w  # Full resolution
+    h2, w2 = latent_h // 2, latent_w // 2  # Half
+    h4, w4 = latent_h // 4, latent_w // 4  # Quarter
+    h8, w8 = latent_h // 8, latent_w // 8  # Eighth
+
+    # ControlNet condition image shape (full resolution * 8 for pixel space)
+    controlnet_cond_shape = (batch_size, 3, latent_h * 8, latent_w * 8)
+
+    # -------------------------------------------------------------------------
+    # Chunk 0: AlphaTimeEmbed - Time and control type embedding (sin/cos)
+    # -------------------------------------------------------------------------
+    if chunk_name == "ControlNetAlphaTimeEmbed":
+        # control_type: [batch_size, num_control_type]
+        control_mode = list(range(num_control_type))
+        control_type = torch.zeros(num_control_type).scatter_(0, torch.tensor(control_mode), 1)
+        control_type = control_type.reshape(1, -1).to(torch.int32).repeat(batch_size, 1)
+        inputs = OrderedDict([
+            ("timestep", torch.tensor([1000.0] * batch_size).float()),
+            ("control_type", control_type),
+        ])
+        return inputs
+
+    # -------------------------------------------------------------------------
+    # Chunk 1: BetaCondFusion - Conditioning fusion
+    # -------------------------------------------------------------------------
+    elif chunk_name == "ControlNetBetaCondFusion":
+        inputs = OrderedDict([
+            ("sample", torch.rand(batch_size, 4, h, w)),
+        ])
+        # Add individual controlnet_cond inputs for each control type
+        for i in range(num_control_type):
+            inputs[f"controlnet_cond_{i}"] = torch.rand(*controlnet_cond_shape)
+        # conditioning_scale: [num_control_type]
+        inputs["conditioning_scale"] = torch.ones(num_control_type)
+        return inputs
+
+    # -------------------------------------------------------------------------
+    # Chunk 2: GammaDown01 - down_blocks[0,1] with projections
+    # -------------------------------------------------------------------------
+    elif chunk_name == "ControlNetGammaDown01":
+        inputs = OrderedDict([
+            ("fused_sample", torch.rand(batch_size, 320, h, w)),
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+        ])
+        return inputs
+
+    # -------------------------------------------------------------------------
+    # Chunk 3: DeltaDown2A - first resnet+attention of down_blocks[2]
+    # -------------------------------------------------------------------------
+    elif chunk_name == "ControlNetDeltaDown2A":
+        # Input hidden comes from GammaDown01, which outputs after down_blocks[1]
+        # down_blocks[1] outputs at channel block_out_channels[1] = 640 (default)
+        hidden_channels = block_out_channels[1] if len(block_out_channels) > 1 else 640
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, hidden_channels, h4, w4)),
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+        ])
+        return inputs
+
+    # -------------------------------------------------------------------------
+    # Chunk 4: DeltaDown2B - second resnet+attention of down_blocks[2]
+    # -------------------------------------------------------------------------
+    elif chunk_name == "ControlNetDeltaDown2B":
+        # Input hidden comes from DeltaDown2A, which outputs after first resnet of down_blocks[2]
+        # First resnet changes channels from 640 to 1280
+        # Spatial dims stay at h4 (no downsampler in last down block)
+        hidden_channels = block_out_channels[2] if len(block_out_channels) > 2 else 1280
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, hidden_channels, h4, w4)),
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+        ])
+        return inputs
+
+    # -------------------------------------------------------------------------
+    # Chunk 5: EpsilonMid - mid_block with projection
+    # -------------------------------------------------------------------------
+    elif chunk_name == "ControlNetEpsilonMid":
+        # Input hidden comes from DeltaDown2B, which outputs after second resnet of down_blocks[2]
+        # down_blocks[2] has NO downsampler (last block), so spatial stays at h4
+        # Channel is block_out_channels[2] = 1280
+        hidden_channels = block_out_channels[2] if len(block_out_channels) > 2 else 1280
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, hidden_channels, h4, w4)),
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+        ])
+        return inputs
+
+    else:
+        raise ValueError(f"Unknown ControlNet chunk name: {chunk_name}")
+
+
+def convert_controlnet_union_architectural_chunks(pipe, args):
+    """
+    Convert ControlNet Union into architectural chunks.
+
+    This creates 6 semantically meaningful chunks that split the ControlNet Union along
+    architectural boundaries for Neural Engine compatibility on mobile devices.
+
+    This 6-chunk architecture is designed for ControlNet Union ProMax which has 3 down_blocks
+    (not 4 like standard SDXL). Total of 10 residual outputs (additional_residual_0 through _9).
+
+    DeltaDown2 is split at the resnet boundary into DeltaDown2A and DeltaDown2B to reduce
+    chunk size from ~1.5GB to ~750MB each.
+
+    Chunks:
+        0. AlphaTimeEmbed: time + control embedding (sin/cos operators)
+        1. BetaCondFusion: conditioning fusion
+        2. GammaDown01: down_blocks[0,1] with projections
+        3. DeltaDown2: down_blocks[2] with projections
+        4. EpsilonMid: mid_block with projection
+    """
+    from python_coreml_stable_diffusion.controlnetunion_architectural_chunks import (
+        CONTROLNET_UNION_CHUNK_NAMES,
+        CONTROLNET_UNION_CHUNK_CLASSES,
+        get_controlnet_union_chunk_output_names,
+        make_beta_cond_fusion_chunk,
+    )
+
+    if not hasattr(pipe, "unet"):
+        raise RuntimeError(
+            "convert_unet() deletes pipe.unet to save RAM. "
+            "Please use convert_controlnet_union_architectural_chunks() before convert_unet()")
+
+    for controlnet_model_version in args.convert_controlnet:
+        logger.info(f"Converting ControlNet {controlnet_model_version} with architectural chunking...")
+
+        # Check if all chunks already exist
+        controlnet_model_name = controlnet_model_version.replace("/", "_")
+        all_exist = all(
+            os.path.exists(os.path.join(args.o, f"ControlNet_{controlnet_model_name}_{chunk_name}.mlpackage"))
+            for chunk_name in CONTROLNET_UNION_CHUNK_NAMES
+        )
+        if all_exist:
+            logger.info("All ControlNet Union architectural chunks already exist, skipping conversion.")
+            continue
+
+        # Load original ControlNet Union model
+        is_union, num_control_type = _is_union_controlnet(controlnet_model_version)
+        if not is_union:
+            raise RuntimeError(
+                f"Architectural chunking is only supported for Union ControlNet models. "
+                f"{controlnet_model_version} is not a Union ControlNet.")
+
+        original_controlnet = ControlNetUnionModel.from_pretrained(
+            controlnet_model_version,
+            use_auth_token=True
+        )
+
+        # Create reference ControlNet Union
+        num_control_type = original_controlnet.config.num_control_type
+        reference_controlnet = controlnetunion.make_controlnet(
+            num_control_types=num_control_type,
+            **original_controlnet.config
+        ).eval()
+
+        load_state_dict_summary = reference_controlnet.load_state_dict(original_controlnet.state_dict())
+        logger.info(f"Loaded ControlNet state dict: {load_state_dict_summary}")
+
+        # Log model architecture info for debugging
+        num_down_blocks = len(reference_controlnet.down_blocks)
+        num_controlnet_down_blocks = len(reference_controlnet.controlnet_down_blocks)
+        logger.info(f"ControlNet Union architecture: {num_down_blocks} down_blocks, {num_controlnet_down_blocks} controlnet_down_blocks")
+        logger.info(f"down_block_types: {reference_controlnet.config.down_block_types}")
+        logger.info(f"block_out_channels: {reference_controlnet.config.block_out_channels}")
+
+        # Common parameters
+        batch_size = 2 if not args.unet_batch_one else 1
+        latent_h = args.latent_h or pipe.unet.config.sample_size
+        latent_w = args.latent_w or pipe.unet.config.sample_size
+
+        # Text encoder hidden size
+        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+            text_hidden_size = args.text_encoder_hidden_size or pipe.unet.config.cross_attention_dim or pipe.text_encoder_2.config.hidden_size
+            text_token_length = args.text_token_sequence_length or pipe.text_encoder_2.config.max_position_embeddings
+        else:
+            text_hidden_size = args.text_encoder_hidden_size or pipe.unet.config.cross_attention_dim or 2048
+            text_token_length = args.text_token_sequence_length or 77
+
+        # Convert each chunk
+        for chunk_name in CONTROLNET_UNION_CHUNK_NAMES:
+            out_path = os.path.join(args.o, f"ControlNet_{controlnet_model_name}_{chunk_name}.mlpackage")
+
+            if os.path.exists(out_path):
+                logger.info(f"Skipping {chunk_name}, already exists at {out_path}")
+                continue
+
+            logger.info(f"Converting {chunk_name}...")
+
+            # Create chunk wrapper
+            if chunk_name == "ControlNetBetaCondFusion":
+                # BetaCondFusion requires factory function for dynamic forward signature
+                chunk_module = make_beta_cond_fusion_chunk(reference_controlnet, num_control_type).eval()
+            else:
+                chunk_class = CONTROLNET_UNION_CHUNK_CLASSES[chunk_name]
+                chunk_module = chunk_class(reference_controlnet).eval()
+
+            # Generate sample inputs
+            sample_inputs = _get_controlnet_union_chunk_sample_inputs(
+                chunk_name, batch_size, latent_h, latent_w,
+                text_hidden_size, text_token_length, num_control_type,
+                controlnet=reference_controlnet
+            )
+
+            sample_inputs_spec = {}
+            for k, v in sample_inputs.items():
+                if isinstance(v, torch.Tensor):
+                    sample_inputs_spec[k] = (v.shape, v.dtype)
+                elif isinstance(v, list) and all(isinstance(t, torch.Tensor) for t in v):
+                    sample_inputs_spec[k] = ([t.shape for t in v], [t.dtype for t in v])
+                else:
+                    sample_inputs_spec[k] = type(v)
+            logger.info(f"Sample inputs for {chunk_name}: {sample_inputs_spec}")
+
+            # JIT trace
+            logger.info(f"JIT tracing {chunk_name}...")
+            traced_chunk = torch.jit.trace(chunk_module, list(sample_inputs.values()))
+            logger.info("Done.")
+
+            # Convert to CoreML
+            coreml_sample_inputs = {}
+            for k, v in sample_inputs.items():
+                if isinstance(v, torch.Tensor):
+                    coreml_sample_inputs[k] = v.numpy().astype(np.float16) if v.dtype == torch.float32 else v.numpy()
+                elif isinstance(v, list):
+                    coreml_sample_inputs[k] = [t.numpy().astype(np.float16) if t.dtype == torch.float32 else t.numpy() for t in v]
+
+            output_names = get_controlnet_union_chunk_output_names(chunk_name, reference_controlnet)
+
+            coreml_chunk, _ = _convert_to_coreml(
+                f"ControlNet_{controlnet_model_name}_{chunk_name}",
+                traced_chunk,
+                coreml_sample_inputs,
+                output_names,
+                args,
+                out_path=out_path,
+            )
+
+            # Make controlnet_cond_* inputs optional (for BetaCondFusion chunk)
+            # This matches the behavior in convert_controlnet() for Union models
+            if chunk_name == "ControlNetBetaCondFusion":
+                spec = coreml_chunk.get_spec()
+                for input_type in spec.description.input:
+                    if "controlnet_cond" in input_type.name:
+                        input_type.type.isOptional = True
+                coreml_chunk = ct.models.MLModel(spec, weights_dir=coreml_chunk.weights_dir)
+
+            # Set metadata
+            coreml_chunk.author = f"Please refer to the Model Card available at huggingface.co/{controlnet_model_version}"
+            coreml_chunk.license = "OpenRAIL (https://huggingface.co/spaces/CompVis/stable-diffusion-license)"
+            coreml_chunk.version = controlnet_model_version
+            coreml_chunk.short_description = f"ControlNet Union {chunk_name} - Architectural chunk for on-device inference"
+
+            # Set package version metadata
+            from python_coreml_stable_diffusion._version import __version__
+            coreml_chunk.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
+            coreml_chunk.user_defined_metadata["chunk_type"] = "architectural"
+            coreml_chunk.user_defined_metadata["chunk_name"] = chunk_name
+
+            coreml_chunk.save(out_path)
+            logger.info(f"Saved {chunk_name} to {out_path}")
+
+            del traced_chunk, coreml_chunk, chunk_module
+            gc.collect()
+
+        del reference_controlnet, original_controlnet
+        gc.collect()
+
+        logger.info(f"ControlNet architectural chunking complete for {controlnet_model_version}.")
+
+
 def get_pipeline(args):
     model_version = args.model_version
 
@@ -2469,9 +2804,22 @@ def main(args):
         logger.info("Converted vae_encoder")
 
     if args.convert_controlnet:
-        logger.info("Converting controlnet")
-        convert_controlnet(pipe, args)
-        logger.info("Converted controlnet")
+        if args.controlnet_chunk_mode == "architectural":
+            # Validate all specified ControlNet models are Union models before conversion
+            for controlnet_model_version in args.convert_controlnet:
+                is_union, _ = _is_union_controlnet(controlnet_model_version)
+                if not is_union:
+                    raise RuntimeError(
+                        f"--controlnet-chunk-mode architectural is only supported for Union ControlNet models.\n"
+                        f"'{controlnet_model_version}' is not a Union ControlNet.\n"
+                        f"Use --controlnet-chunk-mode single for non-Union ControlNet models.")
+            logger.info("Converting ControlNet Union with architectural chunking")
+            convert_controlnet_union_architectural_chunks(pipe, args)
+            logger.info("Converted ControlNet Union with architectural chunking")
+        else:
+            logger.info("Converting controlnet")
+            convert_controlnet(pipe, args)
+            logger.info("Converted controlnet")
         
     if args.convert_unet:
         # Check if we should use architectural chunking (requires pipe access)
@@ -2570,6 +2918,14 @@ def parser_spec():
         help=
         "Converts a ControlNet model hosted on HuggingFace to CoreML format. " \
         "To convert multiple models, provide their names separated by spaces.",
+    )
+    parser.add_argument(
+        "--controlnet-chunk-mode",
+        default="single",
+        choices=["single", "architectural"],
+        help=
+        "ControlNet conversion mode: 'single' (default) converts to a single model, "
+        "'architectural' splits into 4 chunks for Neural Engine compatibility on mobile devices.",
     )
     parser.add_argument("--convert-image-encoder", action="store_true")
     parser.add_argument(
