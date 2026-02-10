@@ -40,6 +40,14 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     /// Optional model used before Unet to control generated images by additonal inputs
     public var controlNet: ControlNetXLProtocol? = nil
 
+    /// Optional model for checking safety of generated image
+    var safetyChecker: SafetyChecker? = nil
+
+    /// Reports whether this pipeline can perform safety checks
+    public var canSafetyCheck: Bool {
+        safetyChecker != nil
+    }
+
     /// Option to reduce memory during image generation
     ///
     /// If true, the pipeline will lazily load TextEncoder, Unet, Decoder, and SafetyChecker
@@ -56,6 +64,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     ///   - unet: Model for noise prediction on latent samples
     ///   - decoder: Model for decoding latent sample to image
     ///   - controlNet: Optional model to control generated images by additonal inputs
+    ///   - safetyChecker: Optional model for checking safety of generated images
     ///   - reduceMemory: Option to enable reduced memory mode
     /// - Returns: Pipeline ready for image generation
     public init(
@@ -67,6 +76,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         decoder: Decoder,
         encoder: Encoder?,
         controlNet: ControlNetXLProtocol? = nil,
+        safetyChecker: SafetyChecker? = nil,
         reduceMemory: Bool = false
     ) {
         self.textEncoder = textEncoder
@@ -77,6 +87,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         self.decoder = decoder
         self.encoder = encoder
         self.controlNet = controlNet
+        self.safetyChecker = safetyChecker
         self.reduceMemory = reduceMemory
     }
 
@@ -95,6 +106,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         if let unetRefiner = unetRefiner { add(unetRefiner.loadProgressWeights.reduce(0, +)) }
         if let encoder = encoder { add(encoder.loadProgressWeights.reduce(0, +)) }
         if let controlNet = controlNet { add(controlNet.loadProgressWeights.reduce(0, +)) }
+        if let safetyChecker = safetyChecker { add(safetyChecker.loadProgressWeights.reduce(0, +)) }
 
         return [totalUnits]
     }
@@ -108,9 +120,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         let prewarmModels: [ResourceManaging]
         if reduceMemory {
             loadModels = []
-            prewarmModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, unetRefiner, encoder, controlNet].compactMap{ $0 as? ResourceManaging }
+            prewarmModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, unetRefiner, encoder, controlNet, safetyChecker].compactMap{ $0 as? ResourceManaging }
         } else {
-            loadModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, encoder, controlNet].compactMap{ $0 as ResourceManaging? }
+            loadModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, encoder, controlNet, safetyChecker].compactMap{ $0 as ResourceManaging? }
             prewarmModels = [unetRefiner].compactMap{ $0 as? ResourceManaging }
         }
 
@@ -128,6 +140,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         decoder.unloadResources()
         encoder?.unloadResources()
         controlNet?.unloadResources()
+        safetyChecker?.unloadResources()
     }
 
     /// Image generation using stable diffusion
@@ -544,23 +557,44 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     }
 
     public func decodeToImages(_ latents: [MLShapedArray<Float32>], configuration config: Configuration) throws -> [CGImage?] {
-        defer {
-            if reduceMemory {
-                decoder.unloadResources()
-            }
-        }
-
         // Use tiled decoding if configured (enables Neural Engine on memory-constrained devices)
+        let images: [CGImage?]
         if config.tilingConfig.enabled {
-            return try decoder.decodeTiled(
+            images = try decoder.decodeTiled(
                 latents,
                 scaleFactor: config.decoderScaleFactor,
                 shiftFactor: config.decoderShiftFactor,
                 tilingConfig: config.tilingConfig
             )
         } else {
-            return try decoder.decode(latents, scaleFactor: config.decoderScaleFactor)
+            images = try decoder.decode(latents, scaleFactor: config.decoderScaleFactor)
         }
+
+        if reduceMemory {
+            decoder.unloadResources()
+        }
+
+        // If safety is disabled return what was decoded
+        if config.disableSafety {
+            return images
+        }
+
+        // If there is no safety checker return what was decoded
+        guard let safetyChecker = safetyChecker else {
+            return images
+        }
+
+        // Otherwise change images which are not safe to nil
+        let safeImages = try images.map { image in
+            guard let image = image else { return nil as CGImage? }
+            return try safetyChecker.isSafe(image) ? image : nil
+        }
+
+        if reduceMemory {
+            safetyChecker.unloadResources()
+        }
+
+        return safeImages
     }
 
     struct ModelInputs {
@@ -612,6 +646,11 @@ extension StableDiffusionXLPipeline {
         if let controlNet = controlNet {
             let controlNetProgress = controlNet.makeLoadProgress()
             root.addTrackedChild(controlNetProgress, units: controlNetProgress.totalUnitCount)
+        }
+
+        if let safetyChecker = safetyChecker {
+            let safetyCheckerProgress = safetyChecker.makeLoadProgress()
+            root.addTrackedChild(safetyCheckerProgress, units: safetyCheckerProgress.totalUnitCount)
         }
 
         return root

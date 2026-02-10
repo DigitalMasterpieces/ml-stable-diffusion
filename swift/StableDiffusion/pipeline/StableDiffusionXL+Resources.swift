@@ -31,6 +31,7 @@ public extension StableDiffusionXLPipeline {
         public let controlledUnetURL: URL
         public let controlledUnetChunk1URL: URL
         public let controlledUnetChunk2URL: URL
+        public let safetyCheckerURL: URL
 
         public init(resourcesAt baseURL: URL) {
             textEncoderURL = baseURL.appending(path: "TextEncoder.mlmodelc")
@@ -51,6 +52,7 @@ public extension StableDiffusionXLPipeline {
             controlledUnetURL = baseURL.appending(path: "ControlledUnet.mlmodelc")
             controlledUnetChunk1URL = baseURL.appending(path: "ControlledUnetChunk1.mlmodelc")
             controlledUnetChunk2URL = baseURL.appending(path: "ControlledUnetChunk2.mlmodelc")
+            safetyCheckerURL = baseURL.appending(path: "SafetyChecker.mlmodelc")
         }
     }
 
@@ -139,6 +141,12 @@ public extension StableDiffusionXLPipeline {
             encoder = nil
         }
 
+        // Optional safety checker
+        var safetyChecker: SafetyChecker? = nil
+        if FileManager.default.fileExists(atPath: urls.safetyCheckerURL.path) {
+            safetyChecker = SafetyChecker(modelAt: urls.safetyCheckerURL, configuration: config)
+        }
+
         // Construct pipeline
         self.init(
             textEncoder: textEncoder,
@@ -149,6 +157,7 @@ public extension StableDiffusionXLPipeline {
             decoder: decoder,
             encoder: encoder,
             controlNet: controlNet,
+            safetyChecker: safetyChecker,
             reduceMemory: reduceMemory
         )
     }
@@ -267,6 +276,12 @@ public extension StableDiffusionXLPipeline {
             }
         }
 
+        // Optional safety checker
+        var safetyChecker: SafetyChecker? = nil
+        if FileManager.default.fileExists(atPath: urls.safetyCheckerURL.path) {
+            safetyChecker = SafetyChecker(modelAt: urls.safetyCheckerURL, configuration: config)
+        }
+
         // Construct pipeline
         self.init(
             textEncoder: textEncoder,
@@ -277,6 +292,7 @@ public extension StableDiffusionXLPipeline {
             decoder: decoder,
             encoder: encoder,
             controlNet: controlNet,
+            safetyChecker: safetyChecker,
             reduceMemory: reduceMemory
         )
     }
