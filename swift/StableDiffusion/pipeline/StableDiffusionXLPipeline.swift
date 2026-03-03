@@ -267,8 +267,6 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             timeSteps = scheduler[0].calculateTimesteps(strength: timestepStrength)
         }
 
-        let timeStepsWrong = scheduler[0].calculateTimesteps(strength: timestepStrength)
-
         // Calculate which step to swap to refiner
         let refinerStartStep = Int(Float(timeSteps.count) * config.refinerStart)
 
