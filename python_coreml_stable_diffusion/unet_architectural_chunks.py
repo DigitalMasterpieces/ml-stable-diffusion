@@ -231,32 +231,33 @@ class SDXLAlphaEncoderBChunk(nn.Module):
         )
 
 
-class SDXLGammaDownblockChunk(nn.Module):
+class SDXLGammaDownblockAChunk(nn.Module):
     """
-    Chunk 2: GammaDownblock
-    Contains: down_blocks[2] (CrossAttnDownBlock2D: 640 -> 1280)
+    Chunk 2: GammaDownblockA - First resnet+attention pair of down_blocks[2]
+    Contains: down_blocks[2].resnets[0] + down_blocks[2].attentions[0]
 
     Note: SDXL only has 3 down_blocks (indices 0, 1, 2), not 4 like SD 1.x/2.x.
-    down_blocks[2] is the final down block before mid_block.
+    down_blocks[2] is a CrossAttnDownBlock2D (640 -> 1280) with 2 resnets and NO downsampler.
+    This chunk handles the first resnet+attention pair (channels 640 -> 1280).
 
     Inputs:
         - hidden: [B, 640, H/4, W/4]
         - emb: [B, 1280, 1, 1]
         - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
-        - ip_hidden_states: IP-Adapter image embeddings (optional, for IP-Adapter)
+        - ip_hidden_states: IP-Adapter image embeddings (optional)
         - ip_adapter_scale: optional
-        - additional_residual_7, _8: [optional] ControlNet residuals for down_blocks[2]
+        - additional_residual_7: [optional] ControlNet residual for down_blocks[2] layer 0
 
     Outputs:
-        - skip_down2_0: [B, 1280, H/4, W/4] skip from layer 0 (with ControlNet residual)
-        - skip_down2_1: [B, 1280, H/4, W/4] skip from layer 1 (with ControlNet residual)
-        - hidden: [B, 1280, H/8, W/8] main path output (after downsampler)
+        - skip_down2_0: [B, 1280, H/4, W/4] skip connection (with ControlNet residual if present)
+        - hidden_out: [B, 1280, H/4, W/4] main path output (without ControlNet residual)
     """
 
     def __init__(self, unet):
         super().__init__()
-        self.down_blocks_2 = unet.down_blocks[2]  # CrossAttnDownBlock2D: 640 -> 1280
-        self.has_attention = hasattr(self.down_blocks_2, 'attentions') and self.down_blocks_2.attentions is not None
+        down_block = unet.down_blocks[2]
+        self.resnet_0 = down_block.resnets[0]
+        self.attn_0 = down_block.attentions[0]
         self.support_image_prompt = unet.support_image_prompt
         self.support_controlnet = unet.support_controlnet
 
@@ -267,52 +268,86 @@ class SDXLGammaDownblockChunk(nn.Module):
         encoder_hidden_states,
         ip_hidden_states=None,
         ip_adapter_scale=None,
-        # ControlNet residuals for down_blocks[2] (indices 7-8 in the full sequence)
         additional_residual_7=None,
+    ):
+        # Combine encoder_hidden_states and ip_hidden_states if IP-Adapter is enabled
+        if self.support_image_prompt and ip_hidden_states is not None:
+            encoder_hidden_states_for_attn = (encoder_hidden_states, ip_hidden_states)
+        else:
+            encoder_hidden_states_for_attn = encoder_hidden_states
+
+        # ResNet 0: 640 -> 1280 channels
+        hidden = self.resnet_0(hidden, emb)
+
+        # Attention 0
+        hidden = self.attn_0(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale=ip_adapter_scale)
+
+        # Skip connection = hidden + ControlNet residual (if present)
+        # Main path hidden_out does NOT include ControlNet residual
+        skip = hidden
+        if self.support_controlnet and additional_residual_7 is not None:
+            skip = hidden + additional_residual_7
+
+        return (skip, hidden)
+
+
+class SDXLGammaDownblockBChunk(nn.Module):
+    """
+    Chunk 3: GammaDownblockB - Second resnet+attention pair of down_blocks[2]
+    Contains: down_blocks[2].resnets[1] + down_blocks[2].attentions[1]
+
+    This is the second half of the original GammaDownblock.
+    Input hidden is already at 1280 channels (upchanneled by GammaDownblockA).
+
+    Inputs:
+        - hidden: [B, 1280, H/4, W/4] from GammaDownblockA
+        - emb: [B, 1280, 1, 1]
+        - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
+        - ip_hidden_states: IP-Adapter image embeddings (optional)
+        - ip_adapter_scale: optional
+        - additional_residual_8: [optional] ControlNet residual for down_blocks[2] layer 1
+
+    Outputs:
+        - skip_down2_1: [B, 1280, H/4, W/4] skip connection (with ControlNet residual if present)
+        - hidden_out: [B, 1280, H/4, W/4] main path output (without ControlNet residual)
+    """
+
+    def __init__(self, unet):
+        super().__init__()
+        down_block = unet.down_blocks[2]
+        self.resnet_1 = down_block.resnets[1]
+        self.attn_1 = down_block.attentions[1]
+        self.support_image_prompt = unet.support_image_prompt
+        self.support_controlnet = unet.support_controlnet
+
+    def forward(
+        self,
+        hidden,
+        emb,
+        encoder_hidden_states,
+        ip_hidden_states=None,
+        ip_adapter_scale=None,
         additional_residual_8=None,
     ):
-        # emb is [B, 1280, 1, 1] - custom unet.py ResnetBlock2D expects 4D temb for Conv2d
-        # Combine encoder_hidden_states and ip_hidden_states into tuple if IP-Adapter is enabled
+        # Combine encoder_hidden_states and ip_hidden_states if IP-Adapter is enabled
         if self.support_image_prompt and ip_hidden_states is not None:
-            encoder_hidden_states_for_block = (encoder_hidden_states, ip_hidden_states)
+            encoder_hidden_states_for_attn = (encoder_hidden_states, ip_hidden_states)
         else:
-            encoder_hidden_states_for_block = encoder_hidden_states
+            encoder_hidden_states_for_attn = encoder_hidden_states
 
-        if self.has_attention:
-            # Check if ip_adapter_scale is supported (custom UNet vs standard diffusers)
-            import inspect
-            sig = inspect.signature(self.down_blocks_2.forward)
-            if 'ip_adapter_scale' in sig.parameters:
-                sample, res_samples = self.down_blocks_2(
-                    hidden_states=hidden,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_block,
-                    ip_adapter_scale=ip_adapter_scale,
-                )
-            else:
-                sample, res_samples = self.down_blocks_2(
-                    hidden_states=hidden,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_block,
-                )
-        else:
-            sample, res_samples = self.down_blocks_2(
-                hidden_states=hidden,
-                temb=emb,
-            )
+        # ResNet 1: 1280 -> 1280 channels
+        hidden = self.resnet_1(hidden, emb)
 
-        # Apply ControlNet residuals to down_blocks[2] outputs if provided
-        # down_blocks[2] has 2 resnets and NO downsampler in SDXL
-        if self.support_controlnet:
-            controlnet_residuals = [additional_residual_7, additional_residual_8]
-            res_samples = tuple(
-                res + ctrl if ctrl is not None else res
-                for res, ctrl in zip(res_samples, controlnet_residuals)
-            )
+        # Attention 1
+        hidden = self.attn_1(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale=ip_adapter_scale)
 
-        # Return all residual samples + main path
-        # Number of residuals depends on layers_per_block and whether there's a downsampler
-        return (*res_samples, sample)
+        # Skip connection = hidden + ControlNet residual (if present)
+        # Main path hidden_out does NOT include ControlNet residual
+        skip = hidden
+        if self.support_controlnet and additional_residual_8 is not None:
+            skip = hidden + additional_residual_8
+
+        return (skip, hidden)
 
 
 class SDXLSigmaCoreChunk(nn.Module):
@@ -452,15 +487,13 @@ class SDXLThetaUpblockAChunk(nn.Module):
 
 class SDXLThetaUpblockBChunk(nn.Module):
     """
-    Chunk 4B: ThetaUpblockB - Remaining layers of up_blocks[0]
-    Contains: ResNet1 + Attention1 + ResNet2 + Attention2 + Upsampler
+    Chunk 6: ThetaUpblockB - Second layer of up_blocks[0] (ResNet1 + Attention1)
+    Contains: ResNet1 + Attention1
 
-    This is the second half of the original ThetaUpblock, split for memory optimization.
-    Processes the remaining two skip connections and performs upsampling.
+    This processes the second skip connection from down_blocks[2] resnet 0.
 
     Skip connection ordering (continuing from ThetaUpblockA):
     - resnet_1 gets skip_down2_0 (1280 ch, from down_blocks[2] resnet 0)
-    - resnet_2 gets skip_down1_2 (640 ch, from down_blocks[1] downsampler)
 
     Inputs:
         - hidden: [B, 1280, H/4, W/4] from ThetaUpblockA
@@ -468,11 +501,10 @@ class SDXLThetaUpblockBChunk(nn.Module):
         - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
         - ip_hidden_states: IP-Adapter image embeddings (optional)
         - skip_0: [B, 1280, H/4, W/4] from down_blocks[2] resnet 0 (skip_down2_0)
-        - skip_1: [B, 640, H/4, W/4] from down_blocks[1] downsampler (skip_down1_2)
         - ip_adapter_scale: optional
 
     Outputs:
-        - hidden_out: [B, 1280, H/2, W/2] upsampled output
+        - hidden_out: [B, 1280, H/4, W/4]
     """
 
     def __init__(self, unet):
@@ -480,9 +512,6 @@ class SDXLThetaUpblockBChunk(nn.Module):
         up_block = unet.up_blocks[0]
         self.resnet_1 = up_block.resnets[1]
         self.attn_1 = up_block.attentions[1]
-        self.resnet_2 = up_block.resnets[2]
-        self.attn_2 = up_block.attentions[2]
-        self.upsampler = up_block.upsamplers[0]
         self.support_image_prompt = unet.support_image_prompt
 
     def forward(
@@ -492,7 +521,6 @@ class SDXLThetaUpblockBChunk(nn.Module):
         encoder_hidden_states,
         ip_hidden_states,
         skip_0,
-        skip_1,
         ip_adapter_scale=None,
     ):
         # Combine encoder_hidden_states and ip_hidden_states into tuple if IP-Adapter is enabled
@@ -507,9 +535,57 @@ class SDXLThetaUpblockBChunk(nn.Module):
         hidden = self.resnet_1(hidden, emb)
         hidden = self.attn_1(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale=ip_adapter_scale)
 
-        # Layer 2: concat with skip_1 (skip_down1_2 from down_blocks[1] downsampler), then ResNet + Attention
-        # hidden: [B, 1280, H/4, W/4], skip_1: [B, 640, H/4, W/4] -> [B, 1920, H/4, W/4]
-        hidden = torch.cat([hidden, skip_1], dim=1)
+        return (hidden,)
+
+
+class SDXLThetaUpblockCChunk(nn.Module):
+    """
+    Chunk 7: ThetaUpblockC - Third layer of up_blocks[0] (ResNet2 + Attention2 + Upsampler)
+    Contains: ResNet2 + Attention2 + Upsampler
+
+    This processes the last skip connection from down_blocks[1] downsampler and performs upsampling.
+
+    Skip connection ordering:
+    - resnet_2 gets skip_down1_2 (640 ch, from down_blocks[1] downsampler)
+
+    Inputs:
+        - hidden: [B, 1280, H/4, W/4] from ThetaUpblockB
+        - emb: [B, 1280, 1, 1]
+        - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
+        - ip_hidden_states: IP-Adapter image embeddings (optional)
+        - skip_0: [B, 640, H/4, W/4] from down_blocks[1] downsampler (skip_down1_2)
+        - ip_adapter_scale: optional
+
+    Outputs:
+        - hidden_out: [B, 1280, H/2, W/2] upsampled output
+    """
+
+    def __init__(self, unet):
+        super().__init__()
+        up_block = unet.up_blocks[0]
+        self.resnet_2 = up_block.resnets[2]
+        self.attn_2 = up_block.attentions[2]
+        self.upsampler = up_block.upsamplers[0]
+        self.support_image_prompt = unet.support_image_prompt
+
+    def forward(
+        self,
+        hidden,
+        emb,
+        encoder_hidden_states,
+        ip_hidden_states,
+        skip_0,
+        ip_adapter_scale=None,
+    ):
+        # Combine encoder_hidden_states and ip_hidden_states into tuple if IP-Adapter is enabled
+        if self.support_image_prompt and ip_hidden_states is not None:
+            encoder_hidden_states_for_attn = (encoder_hidden_states, ip_hidden_states)
+        else:
+            encoder_hidden_states_for_attn = encoder_hidden_states
+
+        # Layer 2: concat with skip_0 (skip_down1_2 from down_blocks[1] downsampler), then ResNet + Attention
+        # hidden: [B, 1280, H/4, W/4], skip_0: [B, 640, H/4, W/4] -> [B, 1920, H/4, W/4]
+        hidden = torch.cat([hidden, skip_0], dim=1)
         hidden = self.resnet_2(hidden, emb)
         hidden = self.attn_2(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale=ip_adapter_scale)
 
@@ -688,22 +764,26 @@ class SDXLOmegaDecoderChunk(nn.Module):
 ARCHITECTURAL_CHUNK_NAMES = [
     "SDXLAlphaEncoderA",    # Chunk 0: time embeddings only
     "SDXLAlphaEncoderB",    # Chunk 1: IP-Adapter + conv_in + down_blocks[0,1]
-    "SDXLGammaDownblock",   # Chunk 2: down_blocks[2]
-    "SDXLSigmaCore",        # Chunk 3: mid_block
-    "SDXLThetaUpblockA",    # Chunk 4: up_blocks[0] layer 0 (ResNet0 + Attention0)
-    "SDXLThetaUpblockB",    # Chunk 5: up_blocks[0] layers 1-2 + upsampler
-    "SDXLLambdaUpblock",    # Chunk 6: up_blocks[1]
-    "SDXLKappaUpblock",     # Chunk 7: up_blocks[2]
-    "SDXLOmegaDecoder",     # Chunk 8: conv_norm_out + conv_act + conv_out
+    "SDXLGammaDownblockA",  # Chunk 2: down_blocks[2] first resnet+attn (640->1280)
+    "SDXLGammaDownblockB",  # Chunk 3: down_blocks[2] second resnet+attn (1280->1280)
+    "SDXLSigmaCore",        # Chunk 4: mid_block
+    "SDXLThetaUpblockA",    # Chunk 5: up_blocks[0] layer 0 (ResNet0 + Attention0)
+    "SDXLThetaUpblockB",    # Chunk 6: up_blocks[0] layer 1 (ResNet1 + Attention1)
+    "SDXLThetaUpblockC",    # Chunk 7: up_blocks[0] layer 2 (ResNet2 + Attention2 + Upsampler)
+    "SDXLLambdaUpblock",    # Chunk 8: up_blocks[1]
+    "SDXLKappaUpblock",     # Chunk 9: up_blocks[2]
+    "SDXLOmegaDecoder",     # Chunk 10: conv_norm_out + conv_act + conv_out
 ]
 
 ARCHITECTURAL_CHUNK_CLASSES = {
     "SDXLAlphaEncoderA": SDXLAlphaEncoderAChunk,
     "SDXLAlphaEncoderB": SDXLAlphaEncoderBChunk,
-    "SDXLGammaDownblock": SDXLGammaDownblockChunk,
+    "SDXLGammaDownblockA": SDXLGammaDownblockAChunk,
+    "SDXLGammaDownblockB": SDXLGammaDownblockBChunk,
     "SDXLSigmaCore": SDXLSigmaCoreChunk,
     "SDXLThetaUpblockA": SDXLThetaUpblockAChunk,
     "SDXLThetaUpblockB": SDXLThetaUpblockBChunk,
+    "SDXLThetaUpblockC": SDXLThetaUpblockCChunk,
     "SDXLLambdaUpblock": SDXLLambdaUpblockChunk,
     "SDXLKappaUpblock": SDXLKappaUpblockChunk,
     "SDXLOmegaDecoder": SDXLOmegaDecoderChunk,
@@ -729,9 +809,12 @@ def get_architectural_chunk_output_names(chunk_name, unet=None):
     # Note: Output names must differ from input names to avoid CoreML conflicts
     static_output_names = {
         "SDXLAlphaEncoderA": ["emb_out"],
+        "SDXLGammaDownblockA": ["skip_down2_0", "hidden_out"],
+        "SDXLGammaDownblockB": ["skip_down2_1", "hidden_out"],
         "SDXLSigmaCore": ["hidden_out"],
         "SDXLThetaUpblockA": ["hidden_out"],
         "SDXLThetaUpblockB": ["hidden_out"],
+        "SDXLThetaUpblockC": ["hidden_out"],
         "SDXLLambdaUpblock": ["hidden_out"],
         "SDXLKappaUpblock": ["hidden_out"],
         "SDXLOmegaDecoder": ["noise_pred"],
@@ -745,16 +828,12 @@ def get_architectural_chunk_output_names(chunk_name, unet=None):
         # Fallback to default SDXL config:
         # - down_blocks[0]: DownBlock2D, 2 resnets + downsampler = 3 skips
         # - down_blocks[1]: CrossAttnDownBlock2D, 2 resnets + downsampler = 3 skips
-        # - down_blocks[2]: CrossAttnDownBlock2D, 2 resnets, NO downsampler = 2 skips
         # Output names must differ from input names to avoid CoreML conflicts
         default_output_names = {
             "SDXLAlphaEncoderB": [
                 "ip_hidden_states_out",
                 "skip_conv_in", "skip_down0_0", "skip_down0_1", "skip_down0_2",
                 "skip_down1_0", "skip_down1_1", "skip_down1_2", "hidden_out"
-            ],
-            "SDXLGammaDownblock": [
-                "skip_down2_0", "skip_down2_1", "hidden_out"  # No downsampler on down_blocks[2]
             ],
         }
         return default_output_names.get(chunk_name, ["output"])
@@ -767,12 +846,6 @@ def get_architectural_chunk_output_names(chunk_name, unet=None):
         names = ["ip_hidden_states_out", "skip_conv_in"]
         names.extend([f"skip_down0_{i}" for i in range(num_res_0)])
         names.extend([f"skip_down1_{i}" for i in range(num_res_1)])
-        names.append("hidden_out")
-        return names
-
-    elif chunk_name == "SDXLGammaDownblock":
-        num_res = _get_block_num_residuals(unet.down_blocks[2])
-        names = [f"skip_down2_{i}" for i in range(num_res)]
         names.append("hidden_out")
         return names
 

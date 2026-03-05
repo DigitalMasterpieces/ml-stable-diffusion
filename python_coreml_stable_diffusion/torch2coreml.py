@@ -239,7 +239,8 @@ def quantize_weights(args):
         # SigmaCore: additional_residual_9
         chunks_with_controlnet = {
             "SDXLAlphaEncoderB": ["additional_residual", "image_embeds"],
-            "SDXLGammaDownblock": ["additional_residual"],
+            "SDXLGammaDownblockA": ["additional_residual"],
+            "SDXLGammaDownblockB": ["additional_residual"],
             "SDXLSigmaCore": ["additional_residual"],
         }
 
@@ -404,13 +405,15 @@ def bundle_resources_for_swift_cli(args):
                                      ("control-unet_chunk3", "ControlledUnetChunk3"),
                                      ("control-unet_chunk4", "ControlledUnetChunk4"),
                                      ("safety_checker", "SafetyChecker"),
-                                     # Architectural chunks for SDXL
+                                     # Architectural chunks for SDXL (11-chunk)
                                      ("SDXLAlphaEncoderA", "SDXLAlphaEncoderA"),
                                      ("SDXLAlphaEncoderB", "SDXLAlphaEncoderB"),
-                                     ("SDXLGammaDownblock", "SDXLGammaDownblock"),
+                                     ("SDXLGammaDownblockA", "SDXLGammaDownblockA"),
+                                     ("SDXLGammaDownblockB", "SDXLGammaDownblockB"),
                                      ("SDXLSigmaCore", "SDXLSigmaCore"),
                                      ("SDXLThetaUpblockA", "SDXLThetaUpblockA"),
                                      ("SDXLThetaUpblockB", "SDXLThetaUpblockB"),
+                                     ("SDXLThetaUpblockC", "SDXLThetaUpblockC"),
                                      ("SDXLLambdaUpblock", "SDXLLambdaUpblock"),
                                      ("SDXLKappaUpblock", "SDXLKappaUpblock"),
                                      ("SDXLOmegaDecoder", "SDXLOmegaDecoder")]:
@@ -1743,7 +1746,8 @@ def _get_architectural_chunk_sample_inputs(
             inputs["additional_residual_6"] = torch.rand(batch_size, 640, h4, w4)  # down_blocks[1].downsampler
         return inputs
 
-    elif chunk_name == "SDXLGammaDownblock":
+    elif chunk_name == "SDXLGammaDownblockA":
+        # First resnet+attention pair of down_blocks[2] (640 -> 1280 channels)
         inputs = OrderedDict([
             ("hidden", torch.rand(batch_size, 640, h4, w4)),
             ("emb", torch.rand(*emb_shape)),
@@ -1752,10 +1756,21 @@ def _get_architectural_chunk_sample_inputs(
         if image_encoder is not None:
             inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
             inputs["ip_adapter_scale"] = torch.tensor([1.0])
-        # Add ControlNet residual inputs if enabled
-        # GammaDownblock handles: down_blocks[2] (7,8) - no downsampler
         if support_controlnet:
             inputs["additional_residual_7"] = torch.rand(batch_size, 1280, h4, w4)  # down_blocks[2].resnets[0]
+        return inputs
+
+    elif chunk_name == "SDXLGammaDownblockB":
+        # Second resnet+attention pair of down_blocks[2] (1280 -> 1280 channels)
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, 1280, h4, w4)),  # already upchanneled by GammaDownblockA
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+        ])
+        if image_encoder is not None:
+            inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
+            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+        if support_controlnet:
             inputs["additional_residual_8"] = torch.rand(batch_size, 1280, h4, w4)  # down_blocks[2].resnets[1]
         return inputs
 
@@ -1791,15 +1806,28 @@ def _get_architectural_chunk_sample_inputs(
         return inputs
 
     elif chunk_name == "SDXLThetaUpblockB":
-        # Remaining layers of up_blocks[0]: ResNet1 + Attention1 + ResNet2 + Attention2 + Upsampler
-        # Takes hidden from ThetaUpblockA, skip_0 from down_blocks[2] resnet 0, skip_1 from down_blocks[1] downsampler
+        # Layer 1 of up_blocks[0]: ResNet1 + Attention1
+        # Takes hidden from ThetaUpblockA, skip_0 from down_blocks[2] resnet 0 (skip_down2_0)
         inputs = OrderedDict([
             ("hidden", torch.rand(batch_size, 1280, h4, w4)),  # from ThetaUpblockA
             ("emb", torch.rand(*emb_shape)),
             ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
             ("ip_hidden_states", torch.rand(*ip_hidden_states_shape) if image_encoder is not None else torch.zeros(batch_size, text_hidden_size, 1, 16)),
             ("skip_0", torch.rand(batch_size, 1280, h4, w4)),  # from down_blocks[2] resnet 0 (skip_down2_0)
-            ("skip_1", torch.rand(batch_size, 640, h4, w4)),   # from down_blocks[1] downsampler (skip_down1_2)
+        ])
+        if image_encoder is not None:
+            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+        return inputs
+
+    elif chunk_name == "SDXLThetaUpblockC":
+        # Layer 2 of up_blocks[0]: ResNet2 + Attention2 + Upsampler
+        # Takes hidden from ThetaUpblockB, skip_0 from down_blocks[1] downsampler (skip_down1_2)
+        inputs = OrderedDict([
+            ("hidden", torch.rand(batch_size, 1280, h4, w4)),  # from ThetaUpblockB
+            ("emb", torch.rand(*emb_shape)),
+            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+            ("ip_hidden_states", torch.rand(*ip_hidden_states_shape) if image_encoder is not None else torch.zeros(batch_size, text_hidden_size, 1, 16)),
+            ("skip_0", torch.rand(batch_size, 640, h4, w4)),   # from down_blocks[1] downsampler (skip_down1_2)
         ])
         if image_encoder is not None:
             inputs["ip_adapter_scale"] = torch.tensor([1.0])

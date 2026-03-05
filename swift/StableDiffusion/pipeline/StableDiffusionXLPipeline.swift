@@ -332,7 +332,8 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 geometryConditioning: geometryConditioning,
                 additionalResiduals: additionalResiduals,
                 imageEmbeds: imageInputEmbeddings,
-                ipAdapterScale: ipAdapterScale
+                ipAdapterScale: ipAdapterScale,
+                reduceMemory: self.reduceMemory
             )
 
             // Only perform guidance when CFG is enabled
