@@ -4,6 +4,9 @@ Run Stable Diffusion on Apple Silicon with Core ML
 
 [\[Blog Post\]](https://machinelearning.apple.com/research/stable-diffusion-coreml-apple-silicon) [\[BibTeX\]](#bibtex)
 
+> **Note:** This is a fork of [apple/ml-stable-diffusion](https://github.com/apple/ml-stable-diffusion) by [Digital Masterpieces GmbH](https://github.com/DigitalMasterpieces) with significant additions for SDXL, ControlNet Union, IP-Adapter, tiled VAE, prompt weighting, and more. See [What's New in This Fork](#whats-new) below.
+>
+> Main developer: Amir Semmo (https://github.com/asemmo)
 
 This repository comprises:
 
@@ -13,6 +16,117 @@ This repository comprises:
 If you run into issues during installation or runtime, please refer to the [FAQ](#faq) section. Please refer to the [System Requirements](#system-requirements) section before getting started.
 
 <img src="assets/readme_reel.png">
+
+## <a name="whats-new"></a> What's New in This Fork
+
+This fork extends Apple's original `ml-stable-diffusion` with the following features:
+
+### Conversion (Python)
+
+- **Architectural UNet Chunking** (`--unet-chunks architectural`): Splits the SDXL UNet into 11 semantically meaningful chunks at architectural boundaries (encoder blocks, mid block, decoder blocks) with explicit skip connections, optimized for Neural Engine deployment on iOS/iPadOS.
+- **ControlNet Union** (`--convert-controlnet` with Union models, `--controlnet-chunk-mode architectural`): Supports multi-control-type Union ControlNet models (e.g. `brad-twinkl/controlnet-union-sdxl-1.0-promax`) that handle canny, depth, pose, etc. in a single model. Can also be split into architectural chunks for mobile.
+- **IP-Adapter** (`--load-ip-adapter`, `--ip-scales`): Integrates IP-Adapter into the UNet at conversion time for image-prompted generation. Per-block scale control allows fine-tuning which attention layers receive the image prompt.
+- **Image Encoder** (`--convert-image-encoder`): Converts the CLIP image encoder needed by IP-Adapter.
+- **Tiled VAE** (`--vae-tiled`, `--vae-tile-latent-size`): Converts VAE encoder/decoder with tiled input shapes for high-resolution generation (1024x1024+) on memory-constrained devices using the Neural Engine.
+- **No-CFG UNet** (`--unet-batch-one`): Converts the UNet with batch size 1 for distilled models (SDXL Lightning, LCM) that do not require Classifier-Free Guidance.
+- **4-Chunk UNet** (`--unet-chunks 4`): Four equal-weight UNet chunks as an alternative to the default 2-chunk split.
+
+### Swift Package & CLI
+
+- **A1111-Style Prompt Weighting**: Supports prompt attention syntax in both SD 1.x and SDXL text encoders:
+  - `(text)` multiplies weight by 1.1 (nesting stacks: `((text))` = 1.21)
+  - `[text]` divides weight by 1.1
+  - `(text:2.5)` sets explicit weight
+  - Escaped brackets: `\(`, `\)`, `\[`, `\]`
+  - Per-token weights are applied to text embeddings with mean-factor normalization to preserve overall magnitude.
+- **ControlNet Union (SDXL)**: Full pipeline support for Union ControlNet models with per-control-type conditioning scales and type masks. Includes a chunked variant for ANE deployment.
+- **IP-Adapter (SDXL)**: Image-prompted generation via `ipAdapterScale` configuration and an image encoder model.
+- **Tiled VAE Encoding/Decoding**: Configurable tile-based VAE processing (`TilingConfiguration`) to run the VAE on the Neural Engine at high resolutions without exceeding memory limits. Uses optimized `vDSP_mmov`-based tile stitching.
+- **Disable Classifier-Free Guidance** (`--no-use-cfg`): For distilled models like SDXL Lightning that generate high-quality images in 1-4 steps without CFG. Reduces UNet inference to batch size 1 for faster generation.
+- **New Schedulers**: `euler` (Discrete Euler, matching HuggingFace `EulerDiscreteScheduler`) and `flow` (Discrete Flow for SD3/Flux-style models).
+- **IP-Adapter Scale** (`--ip-adapter-scale`): Controls the influence of the IP-Adapter image prompt (0.0 to disable).
+- **ControlNet Union Flag** (`--controlnet-union`): Activates Union mode for SDXL ControlNet.
+- **Progress Tracking**: All pipelines (SD 1.x, SDXL, SD3) report granular model loading progress via Foundation's `Progress` API with per-component child progress.
+
+### Example: SDXL Lightning Conversion (No CFG, IP-Adapter, ControlNet Union)
+
+```bash
+# Convert for macOS
+python -m python_coreml_stable_diffusion.torch2coreml \
+  --xl-version \
+  --load-ip-adapter "ozzygt/sdxl-ip-adapter::ip-adapter-plus_sdxl_vit-h.safetensors" \
+  --unet-chunks 4 \
+  --attention-implementation SPLIT_EINSUM \
+  --unet-support-controlnet \
+  --convert-text-encoder \
+  --convert-image-encoder \
+  --convert-vae-encoder \
+  --convert-vae-decoder \
+  --custom-vae-version madebyollin/sdxl-vae-fp16-fix \
+  --convert-unet \
+  --convert-controlnet \
+      diffusers/controlnet-canny-sdxl-1.0-small \
+      brad-twinkl/controlnet-union-sdxl-1.0-promax \
+  --quantize-nbits 6 \
+  --model-version ./lightning-original \
+  -o ./lightning-coreml-mac
+```
+
+```bash
+# Convert with architectural UNet chunking + batch-one (no CFG)
+python -m python_coreml_stable_diffusion.torch2coreml \
+  --xl-version \
+  --load-ip-adapter "ozzygt/sdxl-ip-adapter::ip-adapter-plus_sdxl_vit-h.safetensors" \
+  --attention-implementation SPLIT_EINSUM \
+  --unet-support-controlnet \
+  --custom-vae-version madebyollin/sdxl-vae-fp16-fix \
+  --unet-chunks architectural \
+  --convert-unet \
+  --unet-batch-one \
+  --quantize-nbits 8 \
+  --model-version ./lightning-original \
+  -o ./lightning-coreml-arch
+```
+
+```bash
+# Convert tiled VAE for high-resolution on iOS
+python -m python_coreml_stable_diffusion.torch2coreml \
+  --xl-version \
+  --attention-implementation SPLIT_EINSUM \
+  --convert-vae-encoder \
+  --convert-vae-decoder \
+  --vae-tiled \
+  --custom-vae-version madebyollin/sdxl-vae-fp16-fix \
+  --vae-tile-latent-size 64 \
+  --model-version ./lightning-original \
+  -o ./lightning-coreml-ios
+```
+
+```bash
+# Convert ControlNet Union with architectural chunking
+python -m python_coreml_stable_diffusion.torch2coreml \
+  --xl-version \
+  --attention-implementation SPLIT_EINSUM \
+  --unet-support-controlnet \
+  --unet-batch-one \
+  --custom-vae-version madebyollin/sdxl-vae-fp16-fix \
+  --convert-controlnet brad-twinkl/controlnet-union-sdxl-1.0-promax \
+  --controlnet-chunk-mode architectural \
+  --quantize-nbits 8 \
+  --model-version ./lightning-original \
+  -o ./lightning-coreml-8bit
+```
+
+```bash
+# Apply mixed-bit palettization to UNet
+python -m python_coreml_stable_diffusion.mixed_bit_compression_apply \
+  --custom-vae-version madebyollin/sdxl-vae-fp16-fix \
+  --load-ip-adapter "ozzygt/sdxl-ip-adapter::ip-adapter-plus_sdxl_vit-h.safetensors" \
+  --mlpackage-path ./lightning-coreml/control-unet-16bit.mlpackage \
+  --pre-analysis-json-path ./recipes/palettization_recipe.json \
+  --selected-recipe "recipe_4.52_bit_mixedpalette" \
+  -o ./lightning-coreml/control-unet-4.52bit.mlpackage
+```
 
 ## <a name="system-requirements"></a> System Requirements
 
@@ -353,10 +467,10 @@ Also note that currently the MMDiT model requires fp32 and therefore only suppor
 
 ### Swift Inference
 
-Swift inference for Stable Diffusion 3 is similar to the previous versions. The only difference is that the `--sd3` flag should be used to indicate that the model is a Stable Diffusion 3 model.
+Swift inference for Stable Diffusion 3 is similar to the previous versions. The only difference is that the `--sd3` flag should be used to indicate that the model is a Stable Diffusion 3 model. The `flow` scheduler is recommended for SD3.
 
 ```bash
-swift run StableDiffusionSample <prompt> --resource-path <output-mlpackages-directory/Resources> --output-path <output-dir> --compute-units cpuAndGPU --sd3
+swift run StableDiffusionSample <prompt> --resource-path <output-mlpackages-directory/Resources> --output-path <output-dir> --compute-units cpuAndGPU --sd3 --scheduler flow
 ```
 
 </details>
@@ -388,15 +502,17 @@ python -m python_coreml_stable_diffusion.torch2coreml --convert-unet --convert-v
 swift run StableDiffusionSample <prompt> --resource-path <output-mlpackages-directory/Resources> --output-path <output-dir> --compute-units {cpuAndGPU,cpuAndNeuralEngine} --xl
 ```
 - Only the `base` model is required, `refiner` model is optional and will be used by default if provided in the resource directory
-- ControlNet for XL is not yet supported
+- ControlNet and ControlNet Union are supported for SDXL (use `--controlnet` and `--controlnet-union` flags)
+- For distilled models (SDXL Lightning, LCM), use `--no-use-cfg` to disable Classifier-Free Guidance
+- Use `--ip-adapter-scale <0.0-1.0>` to control IP-Adapter image prompt influence
+- Use `--scheduler euler` for Euler scheduling or `--scheduler flow` for flow-based models
 
 ### Python Inference
 
 ```bash
 python -m python_coreml_stable_diffusion.pipeline --prompt <prompt> --compute-unit {CPU_AND_GPU,CPU_AND_NE} -o <output-dir> -i <output-mlpackages-directory/Resources> --model-version stabilityai/stable-diffusion-xl-base-1.0
 ```
-- `refiner` model is not yet supported
-- ControlNet for XL is not yet supported
+- `refiner` model is not yet supported in the Python pipeline
 
 </details>
 
@@ -411,7 +527,52 @@ Example results using the prompt *"a high quality photo of a surfing dog"* condi
 
 [ControlNet](https://huggingface.co/lllyasviel/ControlNet) allows users to condition image generation with Stable Diffusion on signals such as edge maps, depth maps, segmentation maps, scribbles and pose. Thanks to [@ryu38's contribution](https://github.com/apple/ml-stable-diffusion/pull/153), both the Python CLI and the Swift package support ControlNet models. Please refer to [this section](#converting-models-to-coreml) for details on setting up Stable Diffusion with ControlNet.
 
-Note that ControlNet is not yet supported for Stable Diffusion XL.
+### ControlNet for SDXL
+
+ControlNet is fully supported for Stable Diffusion XL, including standard per-model ControlNets (e.g. `diffusers/controlnet-canny-sdxl-1.0-small`).
+
+### ControlNet Union (SDXL)
+
+ControlNet Union models combine multiple control types (canny, depth, pose, etc.) into a single model. This fork supports Union ControlNets such as [`brad-twinkl/controlnet-union-sdxl-1.0-promax`](https://huggingface.co/brad-twinkl/controlnet-union-sdxl-1.0-promax).
+
+**Conversion:**
+
+```bash
+python -m python_coreml_stable_diffusion.torch2coreml \
+  --xl-version \
+  --attention-implementation SPLIT_EINSUM \
+  --unet-support-controlnet \
+  --convert-controlnet brad-twinkl/controlnet-union-sdxl-1.0-promax \
+  --controlnet-chunk-mode architectural \
+  --quantize-nbits 8 \
+  --model-version <model-version> \
+  -o <output-dir>
+```
+
+- `--controlnet-chunk-mode architectural`: Splits the Union ControlNet into architectural chunks for Neural Engine deployment on iOS/iPadOS.
+- `--controlnet-chunk-mode single`: Keeps the Union ControlNet as a single model (for macOS/GPU).
+
+**Swift CLI:**
+
+```bash
+swift run StableDiffusionSample <prompt> \
+  --resource-path <resources> \
+  --xl \
+  --controlnet union_promax \
+  --controlnet-inputs depth_image.png \
+  --controlnet-union
+```
+
+- `--controlnet-union`: Enables Union mode, which passes control type masks and per-type conditioning scales to the model.
+
+**Swift API:**
+
+```swift
+var config = StableDiffusionPipeline.Configuration(prompt: "...")
+config.controlNetInputs = [[depthImage]]
+config.controlNetTypes = [[4]]           // Control type index (e.g. 4 = depth)
+config.controlNetConditioningScales = [[1.0]]
+```
 
 </details>
 
@@ -559,9 +720,28 @@ This generally takes 15-20 minutes on an M1 MacBook Pro. Upon successful executi
 
 - `--unet-support-controlnet`: enables a converted UNet model to receive additional inputs from ControlNet. This is required for generating image with using ControlNet and saved with a different name, `*_control-unet.mlpackage`, distinct from normal UNet. On the other hand, this UNet model can not work without ControlNet. Please use normal UNet for just txt2img.
 
-- `--unet-batch-one`: use a batch size of one for the unet, this is needed if you do not want to do classifier free guidance, i.e. using a `guidance-scale` of less than one.
+- `--unet-batch-one`: use a batch size of one for the unet. This is needed for distilled models (SDXL Lightning, LCM) that do not use Classifier-Free Guidance and run at `guidance-scale` of 1.0.
 
 - `--convert-vae-encoder`: not required for text-to-image applications. Required for image-to-image applications in order to map the input image to the latent space.
+
+- `--unet-chunks`: Controls how the UNet is split for deployment. Options:
+  - `2` (default when `--chunk-unet` is used): Two equal-weight chunks for ANE deployment.
+  - `4`: Four equal-weight chunks.
+  - `architectural`: Splits the SDXL UNet into 11 semantically meaningful chunks at architectural boundaries with explicit skip connections. This is optimized for Neural Engine deployment and produces the best ANE performance.
+
+- `--load-ip-adapter`: Load an IP-Adapter model to embed into the UNet at conversion time. Format: `"model_name::filename.safetensors"` (e.g. `"ozzygt/sdxl-ip-adapter::ip-adapter-plus_sdxl_vit-h.safetensors"`).
+
+- `--ip-scales`: JSON dictionary of per-block IP-Adapter scales. Keys are UNet block names (e.g. `"up_blocks.0.attentions.1"`), values are floats. Set to `0.0` to disable IP-Adapter influence in specific blocks.
+
+- `--convert-image-encoder`: Convert the CLIP image encoder needed by IP-Adapter for image-prompted generation.
+
+- `--vae-tiled`: Convert the VAE encoder/decoder with tiled input shapes for high-resolution generation on memory-constrained devices using the Neural Engine.
+
+- `--vae-tile-latent-size`: The latent tile size when using `--vae-tiled`. Default is 64, which corresponds to 512x512 pixel tiles. Tiles are processed independently and stitched together.
+
+- `--controlnet-chunk-mode`: Controls how ControlNet Union models are split. Options:
+  - `single`: Keep as a single model (for macOS/GPU).
+  - `architectural`: Split into architectural chunks for Neural Engine deployment on iOS/iPadOS.
 
 </details>
 
@@ -601,16 +781,95 @@ e.g. `</path/to/output/image>/a_photo_of_an_astronaut_riding_a_horse_on_mars.93.
 
 Please use the `--help` flag to learn about batched generation and more.
 
+### CLI Arguments
+
+| Argument | Type | Default | Description |
+| -------- | ---- | ------- | ----------- |
+| `<prompt>` | String | (required) | Text prompt to guide image generation. Supports [A1111-style prompt weighting](#prompt-weighting). |
+| `--negative-prompt` | String | `""` | Negative text prompt |
+| `--resource-path` | Path | `./` | Path to compiled Core ML models and tokenizer resources |
+| `--xl` | Flag | `false` | Use Stable Diffusion XL pipeline |
+| `--sd3` | Flag | `false` | Use Stable Diffusion 3 pipeline |
+| `--image` | Path | `nil` | Starting image for image-to-image generation |
+| `--strength` | Float | `0.5` | Strength for image-to-image (0.0-1.0) |
+| `--image-count` | Int | `1` | Number of images to generate |
+| `--step-count` | Int | `50` | Number of diffusion steps |
+| `--save-every` | Int | `0` | Save intermediate images every N steps (0 = final only) |
+| `--output-path` | Path | `./` | Output directory for generated images |
+| `--seed` | UInt32 | random | Random seed for reproducibility |
+| `--guidance-scale` | Float | `7.5` | CFG scale (0 = random images) |
+| `--compute-units` | Enum | `all` | Compute units: `all`, `cpuOnly`, `cpuAndGPU`, `cpuAndNeuralEngine` |
+| `--scheduler` | Enum | `pndm` | Scheduler: `pndm`, `dpmpp`, `euler`, `flow` |
+| `--rng` | Enum | `numpy` | RNG type: `numpy`, `torch`, `nvidia` |
+| `--controlnet` | [String] | `[]` | ControlNet model names (filenames in Resources/controlnet without extension) |
+| `--controlnet-inputs` | [String] | `[]` | Image paths for each ControlNet model (same order as `--controlnet`) |
+| `--controlnet-union` | Flag | `false` | Enable ControlNet Union mode (SDXL only) |
+| `--disable-safety` | Flag | `false` | Disable the safety checker |
+| `--reduce-memory` | Flag | `false` | Load/unload models just-in-time to reduce peak memory |
+| `--use-cfg` / `--no-use-cfg` | Flag | `true` | Enable/disable Classifier-Free Guidance. Use `--no-use-cfg` for distilled models (SDXL Lightning, LCM). |
+| `--ip-adapter-scale` | Float | `1.0` | IP-Adapter image prompt influence (0.0 to disable) |
+| `--use-multilingual-text-encoder` | Flag | `false` | Use system NLContextualEmbedding as text encoder |
+| `--script` | Enum | `latin` | Script for multilingual contextual embedding |
+
+### <a name="prompt-weighting"></a> Prompt Weighting
+
+The text encoders support A1111-style prompt attention syntax for per-token weight control:
+
+| Syntax | Effect | Example |
+| ------ | ------ | ------- |
+| `(text)` | Weight x 1.1 | `(detailed)` = 1.1 |
+| `((text))` | Nested: 1.1 x 1.1 | `((detailed))` = 1.21 |
+| `[text]` | Weight / 1.1 | `[blurry]` = 0.91 |
+| `(text:W)` | Explicit weight W | `(fire:1.5)` = 1.5 |
+| `\(`, `\)` | Escaped literal brackets | `\(parenthetical\)` |
+
+Weights are applied directly to text embeddings with mean-factor normalization to preserve overall magnitude. This works independently of CFG, so it is effective even with `--no-use-cfg` for distilled models.
+
+```shell
+# Example: emphasize "sunset" and de-emphasize "clouds"
+swift run StableDiffusionSample "a (sunset:1.4) over the ocean with [clouds]" \
+  --xl --resource-path ./resources --step-count 4 --no-use-cfg
+```
+
 ### Example Library Usage
 
 ```swift
 import StableDiffusion
-...
+
+// SD 1.x
 let pipeline = try StableDiffusionPipeline(resourcesAt: resourceURL)
-pipeline.loadResources()
-let image = try pipeline.generateImages(prompt: prompt, seed: seed).first
+
+// SDXL
+let pipeline = try StableDiffusionXLPipeline(
+    resourcesAt: resourceURL,
+    controlNet: [],
+    controlNetUnion: false,
+    configuration: config,
+    reduceMemory: false
+)
+
+// Load resources with progress tracking
+let loadProgress = pipeline.makeLoadProgress()
+try pipeline.loadResources(progress: loadProgress, onProgress: { fraction in
+    print("Loading: \(Int(fraction * 100))%")
+})
+
+// Configure generation
+var pipelineConfig = StableDiffusionPipeline.Configuration(prompt: "a (beautiful:1.3) landscape")
+pipelineConfig.stepCount = 4
+pipelineConfig.useCFG = false              // For SDXL Lightning
+pipelineConfig.schedulerType = .discreteEulerScheduler
+pipelineConfig.ipAdapterScale = 0.7        // IP-Adapter influence
+pipelineConfig.tilingConfig = .default      // Tiled VAE for high-res
+
+// Generate
+let images = try pipeline.generateImages(configuration: pipelineConfig) { progress in
+    print("Step \(progress.step) of \(progress.stepCount)")
+    return true
+}
 ```
-On iOS, the `reduceMemory` option should be set to `true` when constructing `StableDiffusionPipeline`
+
+On iOS, the `reduceMemory` option should be set to `true` when constructing a pipeline.
 
 ### Swift Package Details
 
@@ -621,15 +880,15 @@ This Swift package contains two products:
 
 Both of these products require the Core ML models and tokenization resources to be supplied. When specifying resources via a directory path that directory must contain the following:
 
-- `TextEncoder.mlmodelc` or `TextEncoder2.mlmodelc (text embedding model)
+- `TextEncoder.mlmodelc` or `TextEncoder2.mlmodelc` (text embedding model)
 - `Unet.mlmodelc` or `UnetChunk1.mlmodelc` & `UnetChunk2.mlmodelc` (denoising autoencoder model)
 - `VAEDecoder.mlmodelc` (image decoder model)
 - `vocab.json` (tokenizer vocabulary file)
-- `merges.text` (merges for byte pair encoding file)
+- `merges.txt` (merges for byte pair encoding file)
 
 Optionally, for image2image, in-painting, or similar:
 
-- `VAEEncoder.mlmodelc` (image encoder model) 
+- `VAEEncoder.mlmodelc` (image encoder model)
 
 Optionally, it may also include the safety checker model that some versions of Stable Diffusion include:
 
@@ -637,7 +896,11 @@ Optionally, it may also include the safety checker model that some versions of S
 
 Optionally, for the SDXL refiner:
 
-- `UnetRefiner.mlmodelc` (refiner unet model) 
+- `UnetRefiner.mlmodelc` (refiner unet model)
+
+Optionally, for IP-Adapter (SDXL):
+
+- `ImageEncoder.mlmodelc` (CLIP image encoder for image-prompted generation)
 
 Optionally, for ControlNet:
 
@@ -645,9 +908,15 @@ Optionally, for ControlNet:
 - `controlnet/` (directory containing ControlNet models)
   - `LllyasvielSdControlnetMlsd.mlmodelc` (for example, from lllyasviel/sd-controlnet-mlsd)
   - `LllyasvielSdControlnetDepth.mlmodelc` (for example, from lllyasviel/sd-controlnet-depth)
+  - `ControlNetUnion.mlmodelc` or chunked variants (for ControlNet Union models)
   - Other models you converted
 
-Note that the chunked version of Unet is checked for first. Only if it is not present will the full `Unet.mlmodelc` be loaded. Chunking is required for iOS and iPadOS and not necessary for macOS.
+Optionally, for tiled VAE:
+
+- `VAEDecoderTiled.mlmodelc` (tiled VAE decoder for high-resolution generation)
+- `VAEEncoderTiled.mlmodelc` (tiled VAE encoder)
+
+Note that the chunked version of Unet is checked for first. Only if it is not present will the full `Unet.mlmodelc` be loaded. Chunking is required for iOS and iPadOS and not necessary for macOS. Architectural chunks (11 pieces) are preferred over 2-chunk or 4-chunk splits when available.
 
 </details>
 
