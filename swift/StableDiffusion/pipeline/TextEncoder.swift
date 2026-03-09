@@ -67,25 +67,26 @@ public struct TextEncoder: TextEncoderModel {
         // Get models expected input length
         let inputLength = inputShape.last!
 
-        // Tokenize, padding to the expected length
-        var (tokens, ids) = tokenizer.tokenize(input: text, minCount: inputLength)
+        // Tokenize with prompt weights, padding to the expected length
+        var (tokens, ids, weights) = tokenizer.tokenizeWithWeights(text, minCount: inputLength)
 
         // Truncate if necessary
         if ids.count > inputLength {
             tokens = tokens.dropLast(tokens.count - inputLength)
             ids = ids.dropLast(ids.count - inputLength)
+            weights = weights.dropLast(weights.count - inputLength)
             let truncated = tokenizer.decode(tokens: tokens)
             print("Needed to truncate input '\(text)' to '\(truncated)'")
         }
 
         // Use the model to generate the embedding
-        return try encode(ids: ids)
+        return try encode(ids: ids, weights: weights)
     }
 
     /// Prediction queue
     let queue = DispatchQueue(label: "textencoder.predict")
 
-    func encode(ids: [Int]) throws -> MLShapedArray<Float32> {
+    func encode(ids: [Int], weights: [Float]? = nil) throws -> MLShapedArray<Float32> {
         let inputName = inputDescription.name
         let inputShape = inputShape
 
@@ -99,7 +100,42 @@ public struct TextEncoder: TextEncoderModel {
         }
 
         let embeddingFeature = result.featureValue(for: "last_hidden_state")
-        return MLShapedArray<Float32>(converting: embeddingFeature!.multiArrayValue!)
+        var textEmbeddings = MLShapedArray<Float32>(converting: embeddingFeature!.multiArrayValue!)
+
+        // Apply prompt weights to embeddings
+        if let weights {
+            let shape = textEmbeddings.shape  // [1, 77, dim]
+            let previousMean = textEmbeddings.scalars.withUnsafeBufferPointer { buffer in
+                buffer.reduce(0, +)
+            } / Float(textEmbeddings.scalars.count)
+
+            // Multiply each token position's embedding vector by its weight
+            let newEmbeddings = weights.enumerated().map { index, weight in
+                MLShapedArray<Float32>(
+                    scalars: textEmbeddings[0][index].scalars.map { Float32($0 * weight) },
+                    shape: textEmbeddings[0][index].shape
+                )
+            }
+            textEmbeddings = MLShapedArray<Float32>(concatenating: newEmbeddings, alongAxis: 0)
+
+            let currentMean = textEmbeddings.scalars.withUnsafeBufferPointer { buffer in
+                buffer.reduce(0, +)
+            } / Float(textEmbeddings.scalars.count)
+
+            // Mean-factor normalization to preserve overall embedding magnitude
+            if currentMean != 0 {
+                let meanFactor = Float32(previousMean / currentMean)
+                textEmbeddings = MLShapedArray<Float32>(unsafeUninitializedShape: shape) { scalars, _ in
+                    textEmbeddings.withUnsafeShapedBufferPointer { embeddings, _, _ in
+                        for i in 0..<embeddings.count {
+                            scalars.initializeElement(at: i, to: embeddings[i] * meanFactor)
+                        }
+                    }
+                }
+            }
+        }
+
+        return textEmbeddings
     }
 
     var inputDescription: MLFeatureDescription {
