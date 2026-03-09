@@ -272,7 +272,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         // Encode the input prompt
         var promptEmbedding = try textEncoder.encode(config.prompt)
 
-        if config.guidanceScale >= 1.0 {
+        if config.useCFG {
             // Convert to Unet hidden state representation
             // Concatenate the prompt and negative prompt embeddings
             let negativePromptEmbedding = try textEncoder.encode(config.negativePrompt)
@@ -328,7 +328,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
             let latentUnetInput: [MLShapedArray<Float32>]
-            if config.guidanceScale >= 1.0 {
+            if config.useCFG {
                 latentUnetInput = latents.map {
                     MLShapedArray<Float32>(concatenating: [$0, $0], alongAxis: 0)
                 }
@@ -379,7 +379,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                                                 alongAxis: 0)]
             }
 
-            if config.guidanceScale >= 1.0 {
+            if config.useCFG {
                 noise = performGuidance(noise, config.guidanceScale)
             }
 
@@ -558,7 +558,29 @@ extension StableDiffusionPipeline {
         let root = Progress(totalUnitCount: totalUnits)
         root.localizedDescription = "Preparing pipeline"
 
-        // TODO
+        let textEncoderProgress = textEncoder.makeLoadProgress()
+        root.addTrackedChild(textEncoderProgress, units: textEncoderProgress.totalUnitCount)
+
+        let unetProgress = unet.makeLoadProgress()
+        root.addTrackedChild(unetProgress, units: unetProgress.totalUnitCount)
+
+        let decoderProgress = decoder.makeLoadProgress()
+        root.addTrackedChild(decoderProgress, units: decoderProgress.totalUnitCount)
+
+        if let encoder = encoder {
+            let encoderProgress = encoder.makeLoadProgress()
+            root.addTrackedChild(encoderProgress, units: encoderProgress.totalUnitCount)
+        }
+
+        if let controlNet = controlNet {
+            let controlNetProgress = controlNet.makeLoadProgress()
+            root.addTrackedChild(controlNetProgress, units: controlNetProgress.totalUnitCount)
+        }
+
+        if let safetyChecker = safetyChecker {
+            let safetyCheckerProgress = safetyChecker.makeLoadProgress()
+            root.addTrackedChild(safetyCheckerProgress, units: safetyCheckerProgress.totalUnitCount)
+        }
 
         return root
     }

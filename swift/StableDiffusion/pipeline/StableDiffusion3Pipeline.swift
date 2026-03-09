@@ -492,7 +492,27 @@ extension StableDiffusion3Pipeline {
         let root = Progress(totalUnitCount: totalUnits)
         root.localizedDescription = "Preparing pipeline"
 
-        // TODO
+        let textEncoderProgress = textEncoder.makeLoadProgress()
+        root.addTrackedChild(textEncoderProgress, units: textEncoderProgress.totalUnitCount)
+
+        let textEncoder2Progress = textEncoder2.makeLoadProgress()
+        root.addTrackedChild(textEncoder2Progress, units: textEncoder2Progress.totalUnitCount)
+
+        if let textEncoderT5 = textEncoderT5 {
+            let t5Progress = textEncoderT5.makeLoadProgress()
+            root.addTrackedChild(t5Progress, units: t5Progress.totalUnitCount)
+        }
+
+        let mmditProgress = mmdit.makeLoadProgress()
+        root.addTrackedChild(mmditProgress, units: mmditProgress.totalUnitCount)
+
+        let decoderProgress = decoder.makeLoadProgress()
+        root.addTrackedChild(decoderProgress, units: decoderProgress.totalUnitCount)
+
+        if let encoder = encoder {
+            let encoderProgress = encoder.makeLoadProgress()
+            root.addTrackedChild(encoderProgress, units: encoderProgress.totalUnitCount)
+        }
 
         return root
     }

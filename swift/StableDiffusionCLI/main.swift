@@ -74,7 +74,7 @@ struct StableDiffusionSample: ParsableCommand {
     @Option(help: "Compute units to load model with {all,cpuOnly,cpuAndGPU,cpuAndNeuralEngine}")
     var computeUnits: ComputeUnits = .all
 
-    @Option(help: "Scheduler to use, one of {pndm, dpmpp}")
+    @Option(help: "Scheduler to use, one of {pndm, dpmpp, euler, flow}")
     var scheduler: SchedulerOption = .pndm
 
     @Option(help: "Random number generator to use, one of {numpy, torch, nvidia}")
@@ -92,11 +92,20 @@ struct StableDiffusionSample: ParsableCommand {
     )
     var controlnetInputs: [String] = []
 
+    @Flag(name: .customLong("controlnet-union"), help: "Use ControlNet Union mode (SDXL only)")
+    var controlnetUnion: Bool = false
+
     @Flag(help: "Disable safety checking")
     var disableSafety: Bool = false
 
     @Flag(help: "Reduce memory usage")
     var reduceMemory: Bool = false
+
+    @Flag(inversion: .prefixedNo, help: "Use Classifier-Free Guidance (disable for distilled models like SDXL Lightning)")
+    var useCfg: Bool = true
+
+    @Option(help: "IP-Adapter scale (0.0 to disable, default 1.0)")
+    var ipAdapterScale: Float = 1.0
 
     @Flag(help: "Use system multilingual NLContextualEmbedding as encoder model")
     var useMultilingualTextEncoder: Bool = false
@@ -122,14 +131,13 @@ struct StableDiffusionSample: ParsableCommand {
         if #available(macOS 14.0, iOS 17.0, *) {
             if isXL {
                 scaleFactor = 0.13025
-                if !controlnet.isEmpty {
-                    throw RunError.unsupported("ControlNet is not supported for Stable Diffusion XL")
-                }
                 if useMultilingualTextEncoder {
                     throw RunError.unsupported("Multilingual text encoder is not yet supported for Stable Diffusion XL")
                 }
                 pipeline = try StableDiffusionXLPipeline(
                     resourcesAt: resourceURL,
+                    controlNet: controlnet,
+                    controlNetUnion: controlnetUnion,
                     configuration: config,
                     reduceMemory: reduceMemory
                 )
@@ -169,7 +177,10 @@ struct StableDiffusionSample: ParsableCommand {
             )
         }
 
-        try pipeline.loadResources()
+        let loadProgress = pipeline.makeLoadProgress()
+        try pipeline.loadResources(progress: loadProgress, onProgress: { fraction in
+            print("Loading: \(Int(fraction * 100))%")
+        })
         
         let startingImage: CGImage?
         if let image {
@@ -211,8 +222,10 @@ struct StableDiffusionSample: ParsableCommand {
         pipelineConfig.imageCount = imageCount
         pipelineConfig.stepCount = stepCount
         pipelineConfig.seed = seed
-        pipelineConfig.controlNetInputs = controlNetInputs
+        pipelineConfig.controlNetInputs = controlNetInputs.map { [$0] }
         pipelineConfig.guidanceScale = guidanceScale
+        pipelineConfig.useCFG = useCfg
+        pipelineConfig.ipAdapterScale = ipAdapterScale
         pipelineConfig.schedulerType = scheduler.stableDiffusionScheduler
         pipelineConfig.rngType = rng.stableDiffusionRNG
         pipelineConfig.useDenoisedIntermediates = true
@@ -246,7 +259,7 @@ struct StableDiffusionSample: ParsableCommand {
     }
 
     func handleProgress(
-        _ progress: StableDiffusionPipeline.Progress,
+        _ progress: PipelineProgress,
         _ sampleTimer: SampleTimer
     ) {
         log("\u{1B}[1A\u{1B}[K")
@@ -346,11 +359,13 @@ enum ComputeUnits: String, ExpressibleByArgument, CaseIterable {
 
 @available(iOS 16.2, macOS 13.1, *)
 enum SchedulerOption: String, ExpressibleByArgument {
-    case pndm, dpmpp
+    case pndm, dpmpp, euler, flow
     var stableDiffusionScheduler: StableDiffusionScheduler {
         switch self {
         case .pndm: return .pndmScheduler
         case .dpmpp: return .dpmSolverMultistepScheduler
+        case .euler: return .discreteEulerScheduler
+        case .flow: return .discreteFlowScheduler
         }
     }
 }
@@ -368,7 +383,7 @@ enum RNGOption: String, ExpressibleByArgument {
 }
 
 @available(iOS 16.2, macOS 13.1, *)
-extension Script: ExpressibleByArgument {}
+extension Script: @retroactive ExpressibleByArgument {}
 
 if #available(iOS 16.2, macOS 13.1, *) {
     StableDiffusionSample.main()
