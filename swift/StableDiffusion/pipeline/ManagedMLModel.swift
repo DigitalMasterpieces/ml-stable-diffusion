@@ -98,6 +98,14 @@ public final class ManagedMLModel {
     private func loadModel() throws {
         if loadedModel != nil { return }
 
+        // If already pointing at a compiled .mlmodelc bundle, load directly
+        // (resolving symlinks that ModelCompiler may have created).
+        if modelURL.pathExtension == "mlmodelc" {
+            let resolvedURL = modelURL.resolvingSymlinksInPath()
+            loadedModel = try MLModel(contentsOf: resolvedURL, configuration: configuration)
+            return
+        }
+
         let fm = FileManager.default
 
         // Create persistent cache folder.
@@ -143,10 +151,6 @@ public final class ManagedMLModel {
                 // Compile .mlpackage → .mlmodelc.
                 let compiled = try MLModel.compileModel(at: modelURL)
                 try fm.copyItem(at: compiled, to: cachedModelURL)
-
-            } else if modelURL.pathExtension == "mlmodelc" {
-                // Already compiled → copy.
-                try fm.copyItem(at: modelURL, to: cachedModelURL)
 
             } else if modelURL.pathExtension == "mlmodel" {
                 // Raw → compile then cache.
