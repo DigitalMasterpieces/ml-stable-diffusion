@@ -586,3 +586,26 @@ extension StableDiffusionPipeline {
         return root
     }
 }
+
+// MARK: - ComputePlanProviding
+
+@available(iOS 17.4, macOS 14.4, *)
+extension StableDiffusionPipeline: ComputePlanProviding {
+    public var computePlans: [ComputePlanEntry] {
+        get async throws {
+            var entries: [ComputePlanEntry] = []
+
+            // Protocol existential needs casting.
+            if let provider = textEncoder as? ComputePlanProviding {
+                entries += try await provider.computePlans
+            }
+
+            // Concrete types conform directly.
+            entries += try await self.unet.computePlans
+            entries += try await self.decoder.computePlans
+            if let encoder { entries += try await encoder.computePlans }
+            if let safetyChecker { entries += try await safetyChecker.computePlans }
+            return entries
+        }
+    }
+}
