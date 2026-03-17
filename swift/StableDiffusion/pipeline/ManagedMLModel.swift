@@ -21,6 +21,9 @@ public final class ManagedMLModel {
     /// The loaded model (when loaded)
     var loadedModel: MLModel?
 
+    /// URL of the compiled `.mlmodelc` in the cache (set after first load).
+    var compiledModelURL: URL?
+
     /// Queue to protect access to loaded model
     var queue: DispatchQueue
 
@@ -95,6 +98,22 @@ public final class ManagedMLModel {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
+    // MARK: - Compute Plan
+
+    /// Loads the compute plan for this model using its compiled URL and configuration.
+    ///
+    /// Requires `loadResources` or `perform` to have been called first so that the compiled
+    /// model URL is available. Falls back to the source URL if no compiled model exists yet.
+    @available(iOS 17.4, macOS 14.4, *)
+    public var computePlan: MLComputePlan {
+        get async throws {
+            let url = self.compiledModelURL ?? self.modelURL
+            return try await MLComputePlan.load(contentsOf: url, configuration: self.configuration)
+        }
+    }
+
+    // MARK: - Private
+
     private func loadModel() throws {
         if loadedModel != nil { return }
 
@@ -167,6 +186,7 @@ public final class ManagedMLModel {
         }
 
         // Load the cached compiled model.
+        self.compiledModelURL = cachedModelURL
         loadedModel = try MLModel(contentsOf: cachedModelURL, configuration: configuration)
     }
 }
