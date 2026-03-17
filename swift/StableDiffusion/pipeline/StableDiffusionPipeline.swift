@@ -477,9 +477,10 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 public struct PipelineProgress {
     /// The current phase of image generation
     public enum Phase {
-        case encoding      // Text/image encoding before denoising
-        case denoising     // Main denoising loop
-        case decoding      // VAE decoding at the end
+        case encoding          // Text/image encoding before denoising
+        case readyToDenoise    // After encoding, before denoising loop
+        case denoising         // Main denoising loop
+        case decoding          // VAE decoding at the end
     }
 
     public let pipeline: StableDiffusionPipelineProtocol

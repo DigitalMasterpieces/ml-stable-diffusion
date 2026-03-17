@@ -203,6 +203,18 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             imageEncoder?.unloadResources()
         }
 
+        // Report that encoding is complete and denoising is about to begin.
+        let readyProgress = PipelineProgress(
+            pipeline: self,
+            prompt: config.prompt,
+            step: 0,
+            stepCount: config.stepCount,
+            currentLatentSamples: [],
+            configuration: config,
+            phase: .readyToDenoise
+        )
+        if !progressHandler(readyProgress) { return [] }
+
         /// Setup schedulers
         let scheduler: [Scheduler] = (0..<config.imageCount).map { _ in
             switch config.schedulerType {
