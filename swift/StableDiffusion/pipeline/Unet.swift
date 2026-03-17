@@ -441,3 +441,8 @@ public extension Array where Element == ManagedMLModel {
     }
 }
 
+@available(iOS 17.4, macOS 14.4, *)
+extension Unet: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { self.models }
+}
+

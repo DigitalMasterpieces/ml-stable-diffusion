@@ -127,3 +127,8 @@ public struct MultiModalDiffusionTransformer: ResourceManaging {
         return noise
     }
 }
+
+@available(iOS 17.4, macOS 14.4, *)
+extension MultiModalDiffusionTransformer: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { self.models }
+}

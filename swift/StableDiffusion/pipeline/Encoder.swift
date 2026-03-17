@@ -252,3 +252,8 @@ public struct Encoder: ResourceManaging {
         inputDescription.multiArrayConstraint!.shape.map { $0.intValue }
     }
 }
+
+@available(iOS 17.4, macOS 14.4, *)
+extension Encoder: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { [self.model] }
+}

@@ -178,3 +178,8 @@ public struct SafetyChecker: ResourceManaging {
         return arrayPFx3
     }
 }
+
+@available(iOS 17.4, macOS 14.4, *)
+extension SafetyChecker: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { [self.model] }
+}

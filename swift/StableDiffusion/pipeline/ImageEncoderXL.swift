@@ -106,3 +106,8 @@ public struct ImageEncoderXL: ImageEncoderXLModel {
         inputDescription.multiArrayConstraint!.shape.map { $0.intValue }
     }
 }
+
+@available(iOS 17.4, macOS 14.4, *)
+extension ImageEncoderXL: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { [self.model] }
+}

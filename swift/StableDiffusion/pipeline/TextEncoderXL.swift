@@ -147,3 +147,8 @@ public struct TextEncoderXL: TextEncoderXLModel {
         inputDescription.multiArrayConstraint!.shape.map { $0.intValue }
     }
 }
+
+@available(iOS 17.4, macOS 14.4, *)
+extension TextEncoderXL: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { [self.model] }
+}

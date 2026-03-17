@@ -149,3 +149,8 @@ public struct TextEncoder: TextEncoderModel {
     }
 
 }
+
+@available(iOS 17.4, macOS 14.4, *)
+extension TextEncoder: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { [self.model] }
+}
