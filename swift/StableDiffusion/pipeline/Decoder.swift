@@ -4,6 +4,7 @@
 
 import Foundation
 import CoreML
+import os
 
 /// A decoder model which produces RGB images from latent samples
 @available(iOS 16.2, macOS 13.1, *)
@@ -56,6 +57,8 @@ public struct Decoder: ResourceManaging {
         scaleFactor: Float32,
         shiftFactor: Float32 = 0.0
     ) throws -> [CGImage] {
+        let decodeState = signposter.beginInterval("Decode Latents")
+        defer { signposter.endInterval("Decode Latents", decodeState) }
 
         // Form batch inputs for model
         let inputs: [MLFeatureProvider] = try latents.map { sample in
@@ -144,13 +147,24 @@ public struct Decoder: ResourceManaging {
                 config: tilingConfig
             )
 
+            let tiledState = signposter.beginInterval(
+                "Decode Latents Tiled",
+                "\(grid.count, privacy: .public)x\(grid.first?.count ?? 0, privacy: .public) tiles"
+            )
+
             // Process each tile
             var decodedTiles: [[MLShapedArray<Float32>]] = []
 
-            for row in grid {
+            for (rowIndex, row) in grid.enumerated() {
                 var decodedRow: [MLShapedArray<Float32>] = []
 
-                for tileInfo in row {
+                for (colIndex, tileInfo) in row.enumerated() {
+                    let tileState = signposter.beginInterval(
+                        "Decode Tile",
+
+                        "Tile (\(rowIndex, privacy: .public), \(colIndex, privacy: .public))"
+                    )
+
                     // Extract latent tile from the already-scaled latent
                     let latentTile = TilingUtils.extractLatentTile(
                         from: sampleScaled,
@@ -169,19 +183,24 @@ public struct Decoder: ResourceManaging {
                     let output = result.featureValue(for: outputName)!.multiArrayValue!
                     let imageTile = MLShapedArray<Float32>(converting: output)
 
+                    signposter.endInterval("Decode Tile", tileState)
                     decodedRow.append(imageTile)
                 }
                 decodedTiles.append(decodedRow)
             }
 
             // Stitch image tiles together with blending
-            let stitchedImage = TilingUtils.stitchImageTiles(
-                tiles: decodedTiles,
-                grid: grid,
-                config: tilingConfig,
-                outputHeight: imageHeight,
-                outputWidth: imageWidth
-            )
+            let stitchedImage = signposter.withIntervalSignpost("Stitch Tiles") {
+                TilingUtils.stitchImageTiles(
+                    tiles: decodedTiles,
+                    grid: grid,
+                    config: tilingConfig,
+                    outputHeight: imageHeight,
+                    outputWidth: imageWidth
+                )
+            }
+
+            signposter.endInterval("Decode Latents Tiled", tiledState)
 
             // Convert to CGImage
             let cgImage = try CGImage.fromShapedArray(stitchedImage)

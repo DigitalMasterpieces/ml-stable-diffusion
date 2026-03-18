@@ -3,6 +3,7 @@
 
 import Foundation
 import CoreML
+import os
 import Tokenizers
 
 @available(iOS 17.0, macOS 14.0, *)
@@ -68,13 +69,17 @@ public struct TextEncoderT5: TextEncoderT5Model {
     ///     - text: Input text to be tokenized and then embedded
     ///  - Returns: Embedding representing the input text
     public func encode(_ text: String) throws -> TextEncoderT5Output {
+        let encodeState = signposter.beginInterval("Encode Text")
+        defer { signposter.endInterval("Encode Text", encodeState) }
 
         // Get models expected input length
         let inputLength = inputShape.last!
 
         // Tokenize, padding to the expected length
+        let tokenizeState = signposter.beginInterval("Tokenize")
         var tokens = tokenizer.tokenize(text: text)
         var ids = tokens.map { tokenizer.convertTokenToId($0) ?? 0 }
+        signposter.endInterval("Tokenize", tokenizeState)
 
         // Truncate if necessary
         if ids.count > inputLength {
@@ -117,8 +122,11 @@ public struct TextEncoderT5: TextEncoderT5Model {
             dictionary: [inputName: MLMultiArray(inputArray),
                          attentionMaskName: MLMultiArray(maskArray)])
 
-        let result = try model.perform { model in
-            try model.prediction(from: inputFeatures)
+        // Run CoreML model inference.
+        let result = try signposter.withIntervalSignpost("Text Encoder Predict") {
+            try model.perform { model in
+                try model.prediction(from: inputFeatures)
+            }
         }
 
         let embeddingFeature = result.featureValue(for: "encoder_hidden_states")

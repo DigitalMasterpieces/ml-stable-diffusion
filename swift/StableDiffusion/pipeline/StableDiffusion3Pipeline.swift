@@ -7,6 +7,7 @@ import CoreGraphics
 import CoreImage
 import CoreML
 import Foundation
+import os
 
 @available(iOS 17.0, macOS 14.0, *)
 public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
@@ -82,6 +83,9 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
     public func loadResources(progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+        let loadState = signposter.beginInterval("Load Resources")
+        defer { signposter.endInterval("Load Resources", loadState) }
+
         let loadModels: [ResourceManaging]
         let prewarmModels: [ResourceManaging]
         if reduceMemory {
@@ -115,8 +119,17 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
         configuration config: Configuration,
         progressHandler: (PipelineProgress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
+        let generateState = signposter.beginInterval(
+            "Generate Images",
+
+            "\(config.stepCount, privacy: .public) steps"
+        )
+        defer { signposter.endInterval("Generate Images", generateState) }
+
         // Setup geometry conditioning for base/refiner inputs
-        let sd3Input: ModelInputs = try generateConditioning(using: config)
+        let sd3Input: ModelInputs = try signposter.withIntervalSignpost("Encode Prompt") {
+            try generateConditioning(using: config)
+        }
 
         if reduceMemory {
             textEncoder.unloadResources()
@@ -150,7 +163,19 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
         let timeSteps: [Float] = scheduler[0].calculateTimestepsFromSigmas(strength: timestepStrength)
 
         // De-noising loop
+        let denoiseLoopState = signposter.beginInterval(
+            "Denoise Loop",
+
+            "\(timeSteps.count, privacy: .public) steps"
+        )
+
         for (step, t) in timeSteps.enumerated() {
+            let stepState = signposter.beginInterval(
+                "Denoise Step",
+    
+                "\(step + 1, privacy: .public)/\(timeSteps.count, privacy: .public)"
+            )
+
             // Expand the latents for classifier-free guidance
             // and input to the MMDiT noise prediction model
             let latentUnetInput = latents.map {
@@ -166,10 +191,13 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
                 pooledTextEmbeddings: mmditPooledStates
             )
 
-            noise = performGuidance(noise, config.guidanceScale)
+            noise = signposter.withIntervalSignpost("Guidance") {
+                performGuidance(noise, config.guidanceScale)
+            }
 
             // Have the scheduler compute the previous (t-1) latent
             // sample given the predicted noise and current sample
+            let schedulerStepState = signposter.beginInterval("Scheduler Step")
             for i in 0..<config.imageCount {
                 latents[i] = scheduler[i].step(
                     output: noise[i],
@@ -179,6 +207,9 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
 
                 denoisedLatents[i] = scheduler[i].modelOutputs.last ?? latents[i]
             }
+            signposter.endInterval("Scheduler Step", schedulerStepState)
+
+            signposter.endInterval("Denoise Step", stepState)
 
             let currentLatentSamples = config.useDenoisedIntermediates ? denoisedLatents : latents
 
@@ -195,9 +226,12 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
 
             if !progressHandler(progress) {
                 // Stop if requested by handler
+                signposter.endInterval("Denoise Loop", denoiseLoopState)
                 return []
             }
         }
+
+        signposter.endInterval("Denoise Loop", denoiseLoopState)
 
         // Unload resources
         if reduceMemory {
@@ -205,7 +239,9 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
         }
 
         // Decode the latent samples to images
-        return try decodeToImages(denoisedLatents, configuration: config)
+        return try signposter.withIntervalSignpost("Decode Images") {
+            try decodeToImages(denoisedLatents, configuration: config)
+        }
     }
 
     func encodePrompt(_ prompt: String) throws -> (MLShapedArray<Float32>, MLShapedArray<Float32>) {

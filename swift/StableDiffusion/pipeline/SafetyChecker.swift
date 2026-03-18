@@ -4,6 +4,7 @@
 import Foundation
 import CoreML
 import Accelerate
+import os
 
 /// Image safety checking model
 @available(iOS 16.2, macOS 13.1, *)
@@ -66,6 +67,8 @@ public struct SafetyChecker: ResourceManaging {
     ///     - image: Image to check
     /// - Returns: Whether the model considers the image to be safe
     public func isSafe(_ image: CGImage) throws -> Bool {
+        let safetyState = signposter.beginInterval("Safety Check")
+        defer { signposter.endInterval("Safety Check", safetyState) }
 
         let inputName = "clip_input"
         let adjustmentName = "adjustment"
@@ -79,7 +82,10 @@ public struct SafetyChecker: ResourceManaging {
         let width = inputShape[2].intValue
         let height = inputShape[3].intValue
 
-        let resizedImage = try resizeToRGBA(image, width: width, height: height)
+        // Resize image for safety checker input.
+        let resizedImage = try signposter.withIntervalSignpost("Resize Image") {
+            try resizeToRGBA(image, width: width, height: height)
+        }
 
         let bufferP8x3 = try getRGBPlanes(of: resizedImage)
 
@@ -98,8 +104,11 @@ public struct SafetyChecker: ResourceManaging {
             throw SafetyCheckError.modelInputFailure
         }
 
-        let result = try model.perform { model in
-            try model.prediction(from: input)
+        // Run safety model inference.
+        let result = try signposter.withIntervalSignpost("Safety Predict") {
+            try model.perform { model in
+                try model.prediction(from: input)
+            }
         }
 
         let output = result.featureValue(for: "has_nsfw_concepts")

@@ -2,6 +2,7 @@
 // Copyright (C) 2022 Apple Inc. All Rights Reserved.
 
 import Foundation
+import os
 
 import CoreML
 
@@ -87,6 +88,9 @@ public struct MultiModalDiffusionTransformer: ResourceManaging {
         tokenLevelTextEmbeddings: MLShapedArray<Float32>,
         pooledTextEmbeddings: MLShapedArray<Float32>
     ) throws -> [MLShapedArray<Float32>] {
+        let noiseState = signposter.beginInterval("Predict Noise")
+        defer { signposter.endInterval("Predict Noise", noiseState) }
+
         // Match time step batch dimension to the model / latent samples
         let t = MLShapedArray<Float32>(scalars: [timeStep, timeStep], shape: [2])
 

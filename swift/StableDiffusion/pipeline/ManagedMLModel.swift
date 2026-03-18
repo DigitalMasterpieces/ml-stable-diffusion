@@ -4,6 +4,7 @@
 
 import CoreML
 import CryptoKit
+import os
 
 /// A class to manage and gate access to a Core ML model
 ///
@@ -51,6 +52,7 @@ public final class ManagedMLModel {
     public func unloadResources() {
         queue.sync {
             loadedModel = nil
+            signposter.emitEvent("Unload Model", "\(self.modelURL.lastPathComponent, privacy: .public)")
         }
     }
 
@@ -117,6 +119,12 @@ public final class ManagedMLModel {
     private func loadModel() throws {
         if loadedModel != nil { return }
 
+        let loadState = signposter.beginInterval(
+            "Load Model",
+            "\(self.modelURL.lastPathComponent, privacy: .public)"
+        )
+        defer { signposter.endInterval("Load Model", loadState) }
+
         // If already pointing at a compiled .mlmodelc bundle, load directly
         // (resolving symlinks that ModelCompiler may have created).
         if modelURL.pathExtension == "mlmodelc" {
@@ -143,11 +151,12 @@ public final class ManagedMLModel {
         let baseName = modelURL.deletingPathExtension().lastPathComponent
 
         // Compute a hash so updated bundled models force a fresh compile.
-        let hash: String
-        if modelURL.pathExtension == "mlpackage" {
-            hash = self.cacheDirectoryKey(for: modelURL)
-        } else {
-            hash = self.cacheKey(for: modelURL)
+        let hash: String = signposter.withIntervalSignpost("Compute Hash", "\(baseName, privacy: .public)") {
+            if modelURL.pathExtension == "mlpackage" {
+                self.cacheDirectoryKey(for: modelURL)
+            } else {
+                self.cacheKey(for: modelURL)
+            }
         }
 
         // Cache filename <BaseName>_<hash>.mlmodelc.
@@ -165,6 +174,11 @@ public final class ManagedMLModel {
 
         // If cache missing → compile or copy.
         if !fm.fileExists(atPath: cachedModelURL.path) {
+            let compileState = signposter.beginInterval(
+                "Compile Model",
+
+                "\(baseName, privacy: .public)"
+            )
 
             if modelURL.pathExtension == "mlpackage" {
                 // Compile .mlpackage → .mlmodelc.
@@ -177,12 +191,15 @@ public final class ManagedMLModel {
                 try fm.copyItem(at: compiled, to: cachedModelURL)
 
             } else {
+                signposter.endInterval("Compile Model", compileState)
                 throw NSError(
                     domain: "ModelLoader",
                     code: -1,
                     userInfo: [NSLocalizedDescriptionKey: "Unsupported model type: \(modelURL)"]
                 )
             }
+
+            signposter.endInterval("Compile Model", compileState)
         }
 
         // Load the cached compiled model.

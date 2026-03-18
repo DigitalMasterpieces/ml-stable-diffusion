@@ -7,6 +7,7 @@ import CoreGraphics
 import CoreML
 import Foundation
 import NaturalLanguage
+import os
 
 
 /// A pipeline used to generate image samples from text input using stable diffusion XL
@@ -116,6 +117,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
     public func loadResources(progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+        let loadState = signposter.beginInterval("Load Resources")
+        defer { signposter.endInterval("Load Resources", loadState) }
+
         let loadModels: [ResourceManaging]
         let prewarmModels: [ResourceManaging]
         if reduceMemory {
@@ -153,6 +157,12 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         configuration config: Configuration,
         progressHandler: (PipelineProgress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
+        let generateState = signposter.beginInterval(
+            "Generate Images",
+
+            "\(config.stepCount, privacy: .public) steps"
+        )
+        defer { signposter.endInterval("Generate Images", generateState) }
 
         // Determine input type of Unet
         // SDXL Refiner has a latentTimeIdShape of [2, 5]
@@ -179,13 +189,17 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         // Check if the first textEncoder is available, which is required for base models
         if textEncoder != nil {
-            baseInput = try generateConditioning(using: config, forRefiner: isRefiner)
+            baseInput = try signposter.withIntervalSignpost("Encode Prompt", "base") {
+                try generateConditioning(using: config, forRefiner: isRefiner)
+            }
         }
 
         // Check if the imageEncoder is available
         if let imageEncoder = self.imageEncoder {
             if let imageInput = config.imageInput {
-                imageInputEmbeddings = try imageEncoder.encode(imageInput)
+                imageInputEmbeddings = try signposter.withIntervalSignpost("Encode Image") {
+                    try imageEncoder.encode(imageInput)
+                }
                 ipAdapterScale = config.ipAdapterScale
             } else {
                 ipAdapterScale = 0.0
@@ -194,7 +208,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         // Check if the refiner unet exists, or if the current unet is a refiner
         if unetRefiner != nil || isRefiner {
-            refinerInput = try generateConditioning(using: config, forRefiner: true)
+            refinerInput = try signposter.withIntervalSignpost("Encode Prompt", "refiner") {
+                try generateConditioning(using: config, forRefiner: true)
+            }
         }
 
         if reduceMemory {
@@ -283,7 +299,19 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         let refinerStartStep = Int(Float(timeSteps.count) * config.refinerStart)
 
         // De-noising loop
+        let denoiseLoopState = signposter.beginInterval(
+            "Denoise Loop",
+
+            "\(timeSteps.count, privacy: .public) steps"
+        )
+
         for (step,t) in timeSteps.enumerated() {
+            let stepState = signposter.beginInterval(
+                "Denoise Step",
+    
+                "\(step + 1, privacy: .public)/\(timeSteps.count, privacy: .public)"
+            )
+
             // Expand the latents for classifier-free guidance (if using CFG)
             // and input to the Unet noise prediction model
             var latentUnetInput: [MLShapedArray<Float32>]
@@ -321,6 +349,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             // Execute ControlNet if present, converting empty results to nil
             // to avoid subscript crashes in Unet when no ControlNet images provided.
             var additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
+            let controlNetState: OSSignpostIntervalState? = controlNet != nil
+                ? signposter.beginInterval("ControlNet")
+                : nil
             if let controlNetResult = try controlNet?.execute(
                 latents: latentUnetInput,
                 timeStep: t,
@@ -333,6 +364,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             ), !controlNetResult.isEmpty {
                 additionalResiduals = controlNetResult
             }
+            if let s = controlNetState { signposter.endInterval("ControlNet", s) }
 
             // Predict noise residuals from latent samples
             // and current time step conditioned on hidden states
@@ -350,20 +382,26 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
             // Only perform guidance when CFG is enabled
             if config.useCFG {
-                noise = performGuidance(noise, config.guidanceScale)
+                noise = signposter.withIntervalSignpost("Guidance") {
+                    performGuidance(noise, config.guidanceScale)
+                }
             }
 
             // Have the scheduler compute the previous (t-1) latent
             // sample given the predicted noise and current sample
+            let schedulerStepState = signposter.beginInterval("Scheduler Step")
             for i in 0..<config.imageCount {
                 latents[i] = scheduler[i].step(
                     output: noise[i],
                     timeStep: t,
                     sample: latents[i]
                 )
-                
+
                 denoisedLatents[i] = scheduler[i].modelOutputs.last ?? latents[i]
             }
+            signposter.endInterval("Scheduler Step", schedulerStepState)
+
+            signposter.endInterval("Denoise Step", stepState)
 
             let currentLatentSamples = config.useDenoisedIntermediates ? denoisedLatents : latents
 
@@ -379,9 +417,12 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             )
             if !progressHandler(progress) {
                 // Stop if requested by handler
+                signposter.endInterval("Denoise Loop", denoiseLoopState)
                 return []
             }
         }
+
+        signposter.endInterval("Denoise Loop", denoiseLoopState)
 
         // Unload resources
         if reduceMemory {
@@ -403,7 +444,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         _ = progressHandler(decodingProgress)
 
         // Decode the latent samples to images
-        return try decodeToImages(denoisedLatents, configuration: config)
+        return try signposter.withIntervalSignpost("Decode Images") {
+            try decodeToImages(denoisedLatents, configuration: config)
+        }
     }
 
     func encodePrompt(_ prompt: String, forRefiner: Bool = false) throws -> (MLShapedArray<Float32>, MLShapedArray<Float32>) {

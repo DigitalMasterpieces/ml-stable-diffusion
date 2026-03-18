@@ -4,6 +4,7 @@
 
 import Foundation
 import CoreML
+import os
 
 /// A encoder model which produces latent samples from RGB images
 @available(iOS 16.2, macOS 13.1, *)
@@ -66,6 +67,9 @@ public struct Encoder: ResourceManaging {
         scaleFactor: Float32,
         random: inout RandomSource
     ) throws -> MLShapedArray<Float32> {
+        let encodeState = signposter.beginInterval("Encode Image")
+        defer { signposter.endInterval("Encode Image", encodeState) }
+
         let imageData = try image.planarRGBShapedArray(minValue: -1.0, maxValue: 1.0)
         guard imageData.shape == inputShape else {
             // TODO: Consider auto resizing and croping similar to how Vision or CoreML auto-generated Swift code can accomplish with `MLFeatureValue`
@@ -149,17 +153,29 @@ public struct Encoder: ResourceManaging {
             config: tilingConfig
         )
 
+        let tiledState = signposter.beginInterval(
+            "Encode Image Tiled",
+            "\(grid.count, privacy: .public)x\(grid.first?.count ?? 0, privacy: .public) tiles"
+        )
+
         // Process each tile and collect mean latents (defer sampling until stitched)
         var meanTiles: [[MLShapedArray<Float32>]] = []
         var logvarTiles: [[MLShapedArray<Float32>]] = []
 
-        for row in grid {
+        for (rowIndex, row) in grid.enumerated() {
             var meanRow: [MLShapedArray<Float32>] = []
             var logvarRow: [MLShapedArray<Float32>] = []
 
-            for tileInfo in row {
+            for (colIndex, tileInfo) in row.enumerated() {
+                let tileState = signposter.beginInterval(
+                    "Encode Tile",
+
+                    "Tile (\(rowIndex, privacy: .public), \(colIndex, privacy: .public))"
+                )
+
                 // Extract image tile
                 guard let imageTile = TilingUtils.extractImageTile(from: image, tile: tileInfo) else {
+                    signposter.endInterval("Encode Tile", tileState)
                     throw Error.tileExtractionFailed
                 }
 
@@ -190,6 +206,7 @@ public struct Encoder: ResourceManaging {
                     shape: [4, tileInfo.latentHeight, tileInfo.latentWidth]
                 )
 
+                signposter.endInterval("Encode Tile", tileState)
                 meanRow.append(mean)
                 logvarRow.append(logvar)
             }
@@ -198,22 +215,28 @@ public struct Encoder: ResourceManaging {
         }
 
         // Stitch mean tiles together with blending
-        let stitchedMean = TilingUtils.stitchLatentTiles(
-            tiles: meanTiles,
-            grid: grid,
-            config: tilingConfig,
-            outputHeight: latentHeight,
-            outputWidth: latentWidth
-        )
+        let stitchedMean = signposter.withIntervalSignpost("Stitch Tiles", "mean") {
+            TilingUtils.stitchLatentTiles(
+                tiles: meanTiles,
+                grid: grid,
+                config: tilingConfig,
+                outputHeight: latentHeight,
+                outputWidth: latentWidth
+            )
+        }
 
         // Stitch logvar tiles together with blending
-        let stitchedLogvar = TilingUtils.stitchLatentTiles(
-            tiles: logvarTiles,
-            grid: grid,
-            config: tilingConfig,
-            outputHeight: latentHeight,
-            outputWidth: latentWidth
-        )
+        let stitchedLogvar = signposter.withIntervalSignpost("Stitch Tiles", "logvar") {
+            TilingUtils.stitchLatentTiles(
+                tiles: logvarTiles,
+                grid: grid,
+                config: tilingConfig,
+                outputHeight: latentHeight,
+                outputWidth: latentWidth
+            )
+        }
+
+        signposter.endInterval("Encode Image Tiled", tiledState)
 
         // Now sample noise on the full stitched result for consistency
         let std = MLShapedArray<Float32>(
