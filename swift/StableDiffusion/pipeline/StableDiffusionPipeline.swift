@@ -89,21 +89,18 @@ public extension StableDiffusionPipelineProtocol {
             onProgress?(progress.fractionCompleted)
         }
 
-        for model in loadModels {
-            let modelProgress = progress.children[i]
-            i += 1
-
-            progress.localizedDescription = modelProgress.localizedDescription
-
+        // Load all components concurrently — they have no dependencies at load time.
+        let loadStartIndex = i
+        DispatchQueue.concurrentPerform(iterations: loadModels.count) { index in
+            let modelProgress = progress.children[loadStartIndex + index]
             do {
-                try model.loadResources(progress: modelProgress, prewarm: false)
+                try loadModels[index].loadResources(progress: modelProgress, prewarm: false)
             } catch {
-                print("Error loading resources for \(model): \(error)")
+                print("Error loading resources for \(loadModels[index]): \(error)")
             }
-
             modelProgress.completedUnitCount = modelProgress.totalUnitCount
-            onProgress?(progress.fractionCompleted)
         }
+        onProgress?(progress.fractionCompleted)
     }
 
 }
