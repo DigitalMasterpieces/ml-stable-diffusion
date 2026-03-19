@@ -3,7 +3,6 @@
 // Copyright (C) 2026 Digital Masterpieces GmbH. All Rights Reserved.
 
 import CoreML
-import CryptoKit
 import os
 
 /// A class to manage and gate access to a Core ML model
@@ -21,9 +20,6 @@ public final class ManagedMLModel {
 
     /// The loaded model (when loaded)
     var loadedModel: MLModel?
-
-    /// URL of the compiled `.mlmodelc` in the cache (set after first load).
-    var compiledModelURL: URL?
 
     /// Queue to protect access to loaded model
     var queue: DispatchQueue
@@ -73,44 +69,16 @@ public final class ManagedMLModel {
         }
     }
 
-    /// Compute hash for a model at `modelURL`.
-    func cacheKey(for modelURL: URL) -> String {
-        let data = try! Data(contentsOf: modelURL)
-        let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        return modelURL.deletingPathExtension().lastPathComponent + "_" + hash
-    }
-
-    /// Compute hash for a packaged model at `url`.
-    func cacheDirectoryKey(for url: URL) -> String {
-        let fm = FileManager.default
-        let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: nil)!
-
-        var hasher = SHA256()
-
-        for case let fileURL as URL in enumerator {
-            if (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
-                continue
-            }
-            if let data = try? Data(contentsOf: fileURL) {
-                hasher.update(data: data)
-            }
-        }
-
-        let digest = hasher.finalize()
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
     // MARK: - Compute Plan
 
-    /// Loads the compute plan for this model using its compiled URL and configuration.
+    /// Loads the compute plan for this model using its URL and configuration.
     ///
-    /// Requires `loadResources` or `perform` to have been called first so that the compiled
-    /// model URL is available. Falls back to the source URL if no compiled model exists yet.
+    /// Requires `loadResources` or `perform` to have been called first so that the model
+    /// is available.
     @available(iOS 17.4, macOS 14.4, *)
     public var computePlan: MLComputePlan {
         get async throws {
-            let url = self.compiledModelURL ?? self.modelURL
-            return try await MLComputePlan.load(contentsOf: url, configuration: self.configuration)
+            try await MLComputePlan.load(contentsOf: self.modelURL, configuration: self.configuration)
         }
     }
 
@@ -125,86 +93,9 @@ public final class ManagedMLModel {
         )
         defer { signposter.endInterval("Load Model", loadState) }
 
-        // If already pointing at a compiled .mlmodelc bundle, load directly
-        // (resolving symlinks that ModelCompiler may have created).
-        if modelURL.pathExtension == "mlmodelc" {
-            let resolvedURL = modelURL.resolvingSymlinksInPath()
-            loadedModel = try MLModel(contentsOf: resolvedURL, configuration: configuration)
-            return
-        }
-
-        let fm = FileManager.default
-
-        // Create persistent cache folder.
-        let supportDir = try fm.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let cacheDir = supportDir.appendingPathComponent("CompiledModels", isDirectory: true)
-        if !fm.fileExists(atPath: cacheDir.path) {
-            try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-        }
-
-        // Extract base name (e.g., "TextEncoder2").
-        let baseName = modelURL.deletingPathExtension().lastPathComponent
-
-        // Compute a hash so updated bundled models force a fresh compile.
-        let hash: String = signposter.withIntervalSignpost("Compute Hash", "\(baseName, privacy: .public)") {
-            if modelURL.pathExtension == "mlpackage" {
-                self.cacheDirectoryKey(for: modelURL)
-            } else {
-                self.cacheKey(for: modelURL)
-            }
-        }
-
-        // Cache filename <BaseName>_<hash>.mlmodelc.
-        let cacheName = "\(baseName)_\(hash).mlmodelc"
-        let cachedModelURL = cacheDir.appendingPathComponent(cacheName)
-
-        // Cleanup: remove any old cached versions for this base model.
-        let cacheContents = try fm.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)
-        for url in cacheContents {
-            if url.lastPathComponent.hasPrefix(baseName + "_") &&
-                url.lastPathComponent != cacheName {
-                try? fm.removeItem(at: url)
-            }
-        }
-
-        // If cache missing → compile or copy.
-        if !fm.fileExists(atPath: cachedModelURL.path) {
-            let compileState = signposter.beginInterval(
-                "Compile Model",
-
-                "\(baseName, privacy: .public)"
-            )
-
-            if modelURL.pathExtension == "mlpackage" {
-                // Compile .mlpackage → .mlmodelc.
-                let compiled = try MLModel.compileModel(at: modelURL)
-                try fm.copyItem(at: compiled, to: cachedModelURL)
-
-            } else if modelURL.pathExtension == "mlmodel" {
-                // Raw → compile then cache.
-                let compiled = try MLModel.compileModel(at: modelURL)
-                try fm.copyItem(at: compiled, to: cachedModelURL)
-
-            } else {
-                signposter.endInterval("Compile Model", compileState)
-                throw NSError(
-                    domain: "ModelLoader",
-                    code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Unsupported model type: \(modelURL)"]
-                )
-            }
-
-            signposter.endInterval("Compile Model", compileState)
-        }
-
-        // Load the cached compiled model.
-        self.compiledModelURL = cachedModelURL
-        loadedModel = try MLModel(contentsOf: cachedModelURL, configuration: configuration)
+        // Resolve symlinks that ModelCompiler may have created, then load.
+        let resolvedURL = modelURL.resolvingSymlinksInPath()
+        loadedModel = try MLModel(contentsOf: resolvedURL, configuration: configuration)
     }
 }
 
