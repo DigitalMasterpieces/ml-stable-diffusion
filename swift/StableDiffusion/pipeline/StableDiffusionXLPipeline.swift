@@ -107,7 +107,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         if let unetRefiner = unetRefiner { add(unetRefiner.loadProgressWeights.reduce(0, +)) }
         if let encoder = encoder { add(encoder.loadProgressWeights.reduce(0, +)) }
         if let controlNet = controlNet { add(controlNet.loadProgressWeights.reduce(0, +)) }
-        if let safetyChecker = safetyChecker { add(safetyChecker.loadProgressWeights.reduce(0, +)) }
+        // SafetyChecker is excluded from eager loading — it loads lazily on first use.
 
         return [totalUnits]
     }
@@ -124,9 +124,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         let prewarmModels: [ResourceManaging]
         if reduceMemory {
             loadModels = []
-            prewarmModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, unetRefiner, encoder, controlNet, safetyChecker].compactMap{ $0 as? ResourceManaging }
+            prewarmModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, unetRefiner, encoder, controlNet].compactMap{ $0 as? ResourceManaging }
         } else {
-            loadModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, encoder, controlNet, safetyChecker].compactMap{ $0 as ResourceManaging? }
+            loadModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, encoder, controlNet].compactMap{ $0 as ResourceManaging? }
             prewarmModels = [unetRefiner].compactMap{ $0 as? ResourceManaging }
         }
 
@@ -702,10 +702,7 @@ extension StableDiffusionXLPipeline {
             root.addTrackedChild(controlNetProgress, units: controlNetProgress.totalUnitCount)
         }
 
-        if let safetyChecker = safetyChecker {
-            let safetyCheckerProgress = safetyChecker.makeLoadProgress()
-            root.addTrackedChild(safetyCheckerProgress, units: safetyCheckerProgress.totalUnitCount)
-        }
+        // SafetyChecker is excluded — it loads lazily on first use.
 
         return root
     }
