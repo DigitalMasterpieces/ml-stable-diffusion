@@ -12,7 +12,7 @@ import CoreImage
 import NaturalLanguage
 
 @available(iOS 16.2, macOS 13.1, *)
-struct StableDiffusionSample: ParsableCommand {
+struct StableDiffusionSample: AsyncParsableCommand {
 
     static let configuration = CommandConfiguration(
         abstract: "Run stable diffusion to generate images guided by a text prompt",
@@ -113,7 +113,7 @@ struct StableDiffusionSample: ParsableCommand {
     @Option(help: "The natural language script for the multilingual contextual embedding")
     var script: Script = .latin
 
-    mutating func run() throws {
+    mutating func run() async throws {
         guard FileManager.default.fileExists(atPath: resourcePath) else {
             throw RunError.resources("Resource path does not exist \(resourcePath)")
         }
@@ -178,7 +178,7 @@ struct StableDiffusionSample: ParsableCommand {
         }
 
         let loadProgress = pipeline.makeLoadProgress()
-        try pipeline.loadResources(progress: loadProgress, onProgress: { fraction in
+        try await pipeline.loadResources(progress: loadProgress, onProgress: { fraction in
             print("Loading: \(Int(fraction * 100))%")
         })
         
