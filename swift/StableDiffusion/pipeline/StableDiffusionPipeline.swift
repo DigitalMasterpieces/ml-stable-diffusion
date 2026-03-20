@@ -44,7 +44,7 @@ public protocol StableDiffusionPipelineProtocol {
     var canSafetyCheck: Bool { get }
 
     /// Request resources to be loaded and ready if possible
-    func loadResources(progress: Progress, onProgress: ((Double) -> Void)?) throws
+    func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)?) throws
 
     /// Request resources are unloaded / remove from memory if possible
     func unloadResources()
@@ -57,7 +57,7 @@ public protocol StableDiffusionPipelineProtocol {
 
     func generateImages(
         configuration config: PipelineConfiguration,
-        progressHandler: (PipelineProgress) -> Bool
+        progressHandler: @Sendable (PipelineProgress) -> Bool
     ) throws -> [CGImage?]
 
     func decodeToImages(
@@ -70,7 +70,7 @@ public protocol StableDiffusionPipelineProtocol {
 public extension StableDiffusionPipelineProtocol {
     var canSafetyCheck: Bool { false }
 
-    public func loadModels(loadModels: [ResourceManaging], prewarmModels: [ResourceManaging], progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+    public func loadModels(loadModels: [ResourceManaging], prewarmModels: [ResourceManaging], progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) throws {
         var i = 0
 
         for model in prewarmModels {
@@ -232,7 +232,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     ///
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
-    public func loadResources(progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+    public func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) throws {
         let loadState = signposter.beginInterval("Load Resources")
         defer { signposter.endInterval("Load Resources", loadState) }
 
@@ -267,7 +267,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     ///            The images will be nil if safety checks were performed and found the result to be un-safe
     public func generateImages(
         configuration config: Configuration,
-        progressHandler: (PipelineProgress) -> Bool = { _ in true }
+        progressHandler: @Sendable (PipelineProgress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
         let generateState = signposter.beginInterval(
             "Generate Images",
