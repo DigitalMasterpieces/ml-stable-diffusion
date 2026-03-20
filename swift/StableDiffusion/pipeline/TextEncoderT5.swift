@@ -17,11 +17,8 @@ public struct TextEncoderT5Output {
 }
 
 /// A model for encoding text, suitable for SD3.
-///
-/// **Sendable safety invariant:** The `tokenizer` property (from swift-transformers) is not formally
-/// `Sendable`, but it is a value-semantic tokenizer created at init time and never mutated.
 @available(iOS 17.0, macOS 14.0, *)
-public struct TextEncoderT5: @unchecked Sendable, TextEncoderT5Model {
+public struct TextEncoderT5: TextEncoderT5Model {
 
     /// Text tokenizer
     let tokenizer: Tokenizer
