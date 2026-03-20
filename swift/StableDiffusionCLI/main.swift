@@ -1,7 +1,7 @@
 // For licensing see accompanying LICENSE.md file.
 // Copyright (C) 2022 Apple Inc. All Rights Reserved.
 
-import ArgumentParser
+@preconcurrency import ArgumentParser
 import CoreGraphics
 import CoreML
 import Foundation
@@ -234,10 +234,13 @@ struct StableDiffusionSample: ParsableCommand {
         pipelineConfig.decoderShiftFactor = shiftFactor
         pipelineConfig.schedulerTimestepShift = timestepShift
 
+        // The progress handler runs synchronously within generateImages, so capturing
+        // self and sampleTimer is safe. Use nonisolated(unsafe) to satisfy the @Sendable requirement.
+        nonisolated(unsafe) let handler = self
         let images = try pipeline.generateImages(
             configuration: pipelineConfig) { progress in
                 sampleTimer.stop()
-                handleProgress(progress,sampleTimer)
+                handler.handleProgress(progress, sampleTimer)
                 if progress.stepCount != progress.step {
                     sampleTimer.start()
                 }
@@ -383,7 +386,7 @@ enum RNGOption: String, ExpressibleByArgument {
 }
 
 @available(iOS 16.2, macOS 13.1, *)
-extension Script: @retroactive ExpressibleByArgument {}
+extension Script: ExpressibleByArgument {}
 
 if #available(iOS 16.2, macOS 13.1, *) {
     StableDiffusionSample.main()
