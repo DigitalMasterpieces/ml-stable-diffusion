@@ -44,7 +44,7 @@ public protocol StableDiffusionPipelineProtocol {
     var canSafetyCheck: Bool { get }
 
     /// Request resources to be loaded and ready if possible
-    func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)?) throws
+    func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)?) async throws
 
     /// Request resources are unloaded / remove from memory if possible
     func unloadResources()
@@ -70,9 +70,10 @@ public protocol StableDiffusionPipelineProtocol {
 public extension StableDiffusionPipelineProtocol {
     var canSafetyCheck: Bool { false }
 
-    public func loadModels(loadModels: [ResourceManaging], prewarmModels: [ResourceManaging], progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) throws {
+    public func loadModels(loadModels: [ResourceManaging], prewarmModels: [ResourceManaging], progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) async throws {
         var i = 0
 
+        // Prewarm sequentially — these models are loaded then immediately unloaded.
         for model in prewarmModels {
             let modelProgress = progress.children[i]
             i += 1
@@ -89,16 +90,20 @@ public extension StableDiffusionPipelineProtocol {
             onProgress?(progress.fractionCompleted)
         }
 
-        // Load all components concurrently — they have no dependencies at load time.
+        // Load all components concurrently via TaskGroup — they have no dependencies at load time.
         let loadStartIndex = i
-        DispatchQueue.concurrentPerform(iterations: loadModels.count) { index in
-            let modelProgress = progress.children[loadStartIndex + index]
-            do {
-                try loadModels[index].loadResources(progress: modelProgress, prewarm: false)
-            } catch {
-                print("Error loading resources for \(loadModels[index]): \(error)")
+        await withTaskGroup(of: Void.self) { group in
+            for (index, model) in loadModels.enumerated() {
+                group.addTask {
+                    let modelProgress = progress.children[loadStartIndex + index]
+                    do {
+                        try model.loadResources(progress: modelProgress, prewarm: false)
+                    } catch {
+                        print("Error loading resources for \(model): \(error)")
+                    }
+                    modelProgress.completedUnitCount = modelProgress.totalUnitCount
+                }
             }
-            modelProgress.completedUnitCount = modelProgress.totalUnitCount
         }
         onProgress?(progress.fractionCompleted)
     }
@@ -232,7 +237,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     ///
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
-    public func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) throws {
+    public func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) async throws {
         let loadState = signposter.beginInterval("Load Resources")
         defer { signposter.endInterval("Load Resources", loadState) }
 
@@ -246,7 +251,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             prewarmModels = []
         }
 
-        try self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
+        try await self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
     }
 
     /// Unload the underlying resources to free up memory

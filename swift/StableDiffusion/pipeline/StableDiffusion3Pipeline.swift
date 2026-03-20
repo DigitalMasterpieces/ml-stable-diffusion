@@ -82,7 +82,7 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
     ///
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
-    public func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) throws {
+    public func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) async throws {
         let loadState = signposter.beginInterval("Load Resources")
         defer { signposter.endInterval("Load Resources", loadState) }
 
@@ -96,7 +96,7 @@ public struct StableDiffusion3Pipeline: StableDiffusionPipelineProtocol {
             prewarmModels = []
         }
 
-        try self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
+        try await self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
     }
 
     /// Unload the underlying resources to free up memory
