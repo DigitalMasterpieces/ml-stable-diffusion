@@ -1,7 +1,7 @@
 // For licensing see accompanying LICENSE.md file.
 // Copyright (C) 2022 Apple Inc. All Rights Reserved.
 
-@preconcurrency import ArgumentParser
+import ArgumentParser
 import CoreGraphics
 import CoreML
 import Foundation
