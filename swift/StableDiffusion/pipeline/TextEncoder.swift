@@ -88,9 +88,6 @@ public struct TextEncoder: TextEncoderModel {
         return try encode(ids: ids, weights: weights)
     }
 
-    /// Prediction queue
-    let queue = DispatchQueue(label: "textencoder.predict")
-
     func encode(ids: [Int], weights: [Float]? = nil) throws -> MLShapedArray<Float32> {
         let inputName = inputDescription.name
         let inputShape = inputShape

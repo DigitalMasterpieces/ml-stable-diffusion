@@ -9,20 +9,24 @@ import os
 ///
 /// It will automatically load a model into memory when needed or requested
 /// It allows one to request to unload the model from memory
+/// A class to manage and gate access to a Core ML model.
+///
+/// **Sendable safety invariant:** All mutable state (`loadedModel`) is accessed exclusively
+/// through the serial `DispatchQueue` via `queue.sync {}`. This is manually-verified thread-safe.
 @available(iOS 16.2, macOS 13.1, *)
-public final class ManagedMLModel {
+public final class ManagedMLModel: @unchecked Sendable {
 
     /// The location of the model
-    var modelURL: URL
+    let modelURL: URL
 
     /// The configuration to be used when the model is loaded
-    var configuration: MLModelConfiguration
+    let configuration: MLModelConfiguration
 
     /// The loaded model (when loaded)
-    var loadedModel: MLModel?
+    private var loadedModel: MLModel?
 
     /// Queue to protect access to loaded model
-    var queue: DispatchQueue
+    private let queue: DispatchQueue
 
     /// Create a managed model given its location and desired loaded configuration
     ///
@@ -32,7 +36,9 @@ public final class ManagedMLModel {
     /// - Returns: A managed model that has not been loaded
     public init(modelAt url: URL, configuration: MLModelConfiguration) {
         self.modelURL = url
-        self.configuration = configuration
+        // Defensive copy: MLModelConfiguration is a reference type, so the caller could
+        // mutate it after init. Copying ensures our configuration is stable.
+        self.configuration = configuration.copy() as! MLModelConfiguration
         self.loadedModel = nil
         self.queue = DispatchQueue(label: "managed.\(url.lastPathComponent)")
     }

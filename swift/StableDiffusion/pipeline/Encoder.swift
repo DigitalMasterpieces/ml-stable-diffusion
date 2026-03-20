@@ -52,9 +52,6 @@ public struct Encoder: ResourceManaging {
        model.unloadResources()
     }
     
-    /// Prediction queue
-    let queue = DispatchQueue(label: "encoder.predict")
-
     /// Encode image into latent sample
     ///
     ///  - Parameters:
