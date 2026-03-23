@@ -163,7 +163,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         var baseInput: ModelInputs?
         var refinerInput: ModelInputs?
         var imageInputEmbeddings: ImageEncoderXLModel.ImageEncoderXLOutput?
-        var ipAdapterScale: Float?
+        var ipAdapterBlockScales: [Float]?
 
         // Report encoding phase before text encoding starts
         let encodingProgress = PipelineProgress(
@@ -186,9 +186,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         if let imageEncoder = self.imageEncoder {
             if let imageInput = config.imageInput {
                 imageInputEmbeddings = try imageEncoder.encode(imageInput)
-                ipAdapterScale = config.ipAdapterScale
+                ipAdapterBlockScales = config.ipAdapterBlockScales
             } else {
-                ipAdapterScale = 0.0
+                ipAdapterBlockScales = Array(repeating: 0.0, count: 11)
             }
         }
 
@@ -332,7 +332,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 geometryConditioning: geometryConditioning,
                 additionalResiduals: additionalResiduals,
                 imageEmbeds: imageInputEmbeddings,
-                ipAdapterScale: ipAdapterScale,
+                ipAdapterBlockScales: ipAdapterBlockScales,
                 reduceMemory: self.reduceMemory
             )
 

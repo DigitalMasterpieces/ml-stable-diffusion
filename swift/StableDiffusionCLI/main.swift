@@ -104,8 +104,8 @@ struct StableDiffusionSample: ParsableCommand {
     @Flag(inversion: .prefixedNo, help: "Use Classifier-Free Guidance (disable for distilled models like SDXL Lightning)")
     var useCfg: Bool = true
 
-    @Option(help: "IP-Adapter scale (0.0 to disable, default 1.0)")
-    var ipAdapterScale: Float = 1.0
+    @Option(help: "IP-Adapter per-block scales (comma-separated, 11 values for attention blocks)")
+    var ipAdapterBlockScales: String?
 
     @Flag(help: "Use system multilingual NLContextualEmbedding as encoder model")
     var useMultilingualTextEncoder: Bool = false
@@ -225,7 +225,9 @@ struct StableDiffusionSample: ParsableCommand {
         pipelineConfig.controlNetInputs = controlNetInputs.map { [$0] }
         pipelineConfig.guidanceScale = guidanceScale
         pipelineConfig.useCFG = useCfg
-        pipelineConfig.ipAdapterScale = ipAdapterScale
+        if let scalesStr = ipAdapterBlockScales {
+            pipelineConfig.ipAdapterBlockScales = scalesStr.split(separator: ",").map { Float($0.trimmingCharacters(in: .whitespaces))! }
+        }
         pipelineConfig.schedulerType = scheduler.stableDiffusionScheduler
         pipelineConfig.rngType = rng.stableDiffusionRNG
         pipelineConfig.useDenoisedIntermediates = true

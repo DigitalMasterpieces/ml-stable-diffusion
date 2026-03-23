@@ -194,7 +194,7 @@ def quantize_weights(args):
     """
     # Optional inputs that need to be restored after quantization
     # (quantization loses the isOptional flag)
-    controlnet_optional_inputs = ["additional_residual", "image_embeds"]
+    controlnet_optional_inputs = ["additional_residual", "image_embeds", "ip_adapter_scale_block"]
 
     for model_name in ["text_encoder", "text_encoder_2", "image_encoder", "unet", "refiner"]:
         logger.info(f"Quantizing {model_name} to {args.quantize_nbits}-bit precision")
@@ -238,10 +238,14 @@ def quantize_weights(args):
         # GammaDownblock: additional_residual_7, _8
         # SigmaCore: additional_residual_9
         chunks_with_controlnet = {
-            "SDXLAlphaEncoderB": ["additional_residual", "image_embeds"],
-            "SDXLGammaDownblockA": ["additional_residual"],
-            "SDXLGammaDownblockB": ["additional_residual"],
-            "SDXLSigmaCore": ["additional_residual"],
+            "SDXLAlphaEncoderB": ["additional_residual", "image_embeds", "ip_adapter_scale_block"],
+            "SDXLGammaDownblockA": ["additional_residual", "ip_adapter_scale_block"],
+            "SDXLGammaDownblockB": ["additional_residual", "ip_adapter_scale_block"],
+            "SDXLSigmaCore": ["additional_residual", "ip_adapter_scale_block"],
+            "SDXLThetaUpblockA": ["ip_adapter_scale_block"],
+            "SDXLThetaUpblockB": ["ip_adapter_scale_block"],
+            "SDXLThetaUpblockC": ["ip_adapter_scale_block"],
+            "SDXLLambdaUpblock": ["ip_adapter_scale_block"],
         }
 
         for chunk_name in ARCHITECTURAL_CHUNK_NAMES:
@@ -1191,15 +1195,11 @@ def _attn_processors(unet_cls) -> Dict[str, nn.Module]:
     return processors
 
 def _set_ip_adapter_additional_scales(unet_cls, ip_scales):
-    for attn_name, attn_processor in _attn_processors(unet_cls).items():
-        if isinstance(
-            attn_processor, (IPAdapterAttnProcessor2_0)
-        ):
-            for i, scale in enumerate(ip_scales):
-                for k, s in scale.items():
-                    if attn_name.startswith(k):
-                        logger.info(f"Setting processor additional scale of {attn_name} to value {s}")
-                        attn_processor.ip_adapter_scale_additional = torch.tensor([s])
+    """DEPRECATED: IP-Adapter per-block scales are now runtime inputs, not baked constants.
+    This function is kept for backward compatibility but is a no-op.
+    Per-block scales are passed as ip_adapter_scale_block inputs to each chunk at runtime.
+    """
+    logger.info("Skipping _set_ip_adapter_additional_scales: per-block scales are now runtime inputs")
 
 def convert_unet(pipe, args, model_name=None):
     """ Converts the UNet component of Stable Diffusion
@@ -1335,7 +1335,6 @@ def convert_unet(pipe, args, model_name=None):
                     image_embeds_shape = (batch_size, 1, image_enc_cfg.projection_dim)
 
                 additional_xl_inputs["image_embeds"] = torch.rand(*image_embeds_shape)
-                additional_xl_inputs["ip_adapter_scale"] = torch.tensor([1.0])
                 sample_unet_inputs.update(additional_xl_inputs)
                 baseline_sample_unet_inputs['added_cond_kwargs'] = additional_xl_inputs
             else:
@@ -1488,8 +1487,6 @@ def convert_unet(pipe, args, model_name=None):
             if pipe.image_encoder is not None:
                 coreml_unet.input_description["image_embeds"] = \
                 "Additional embeddings from image_encoder that if specified are added to the embeddings that are passed along to the UNet blocks."
-                coreml_unet.input_description["ip_adapter_scale"] = \
-                "Weight of the additional embeddings from image_encoder when used in attention processors."
 
         # Set the output descriptions
         coreml_unet.output_description["noise_pred"] = \
@@ -1650,11 +1647,16 @@ def convert_unet_architectural_chunks(pipe, args):
             out_path=out_path,
         )
 
-        # Make ControlNet additional_residual inputs optional (if defined)
-        if args.unet_support_controlnet:
+        # Make optional inputs: ControlNet residuals, image_embeds, and ip_adapter_scale_block_*
+        needs_optional_fixup = args.unet_support_controlnet or (pipe.image_encoder is not None)
+        if needs_optional_fixup:
             spec = coreml_chunk.get_spec()
             for input_type in spec.description.input:
                 if input_type.name.startswith("additional_residual"):
+                    input_type.type.isOptional = True
+                if input_type.name == "image_embeds":
+                    input_type.type.isOptional = True
+                if input_type.name.startswith("ip_adapter_scale_block"):
                     input_type.type.isOptional = True
             coreml_chunk = ct.models.MLModel(spec, weights_dir=coreml_chunk.weights_dir)
 
@@ -1733,7 +1735,8 @@ def _get_architectural_chunk_sample_inputs(
             else:
                 image_embeds_shape = (batch_size, 1, image_enc_cfg.projection_dim)
             inputs["image_embeds"] = torch.rand(*image_embeds_shape)
-            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_0"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_1"] = torch.tensor([1.0])
         # Add ControlNet residual inputs if enabled
         # AlphaEncoderB handles: conv_in (0) + down_blocks[0] (1,2,3) + down_blocks[1] (4,5,6)
         if support_controlnet:
@@ -1755,7 +1758,7 @@ def _get_architectural_chunk_sample_inputs(
         ])
         if image_encoder is not None:
             inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
-            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_2"] = torch.tensor([1.0])
         if support_controlnet:
             inputs["additional_residual_7"] = torch.rand(batch_size, 1280, h4, w4)  # down_blocks[2].resnets[0]
         return inputs
@@ -1769,7 +1772,7 @@ def _get_architectural_chunk_sample_inputs(
         ])
         if image_encoder is not None:
             inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
-            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_3"] = torch.tensor([1.0])
         if support_controlnet:
             inputs["additional_residual_8"] = torch.rand(batch_size, 1280, h4, w4)  # down_blocks[2].resnets[1]
         return inputs
@@ -1783,7 +1786,7 @@ def _get_architectural_chunk_sample_inputs(
         ])
         if image_encoder is not None:
             inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
-            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_4"] = torch.tensor([1.0])
         # Add ControlNet residual input if enabled
         # SigmaCore handles: mid_block (9) - same spatial dims as hidden
         if support_controlnet:
@@ -1802,7 +1805,7 @@ def _get_architectural_chunk_sample_inputs(
             ("skip_0", torch.rand(batch_size, 1280, h4, w4)),  # from down_blocks[2] resnet 1 (skip_down2_1)
         ])
         if image_encoder is not None:
-            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_5"] = torch.tensor([1.0])
         return inputs
 
     elif chunk_name == "SDXLThetaUpblockB":
@@ -1816,7 +1819,7 @@ def _get_architectural_chunk_sample_inputs(
             ("skip_0", torch.rand(batch_size, 1280, h4, w4)),  # from down_blocks[2] resnet 0 (skip_down2_0)
         ])
         if image_encoder is not None:
-            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_6"] = torch.tensor([1.0])
         return inputs
 
     elif chunk_name == "SDXLThetaUpblockC":
@@ -1830,7 +1833,7 @@ def _get_architectural_chunk_sample_inputs(
             ("skip_0", torch.rand(batch_size, 640, h4, w4)),   # from down_blocks[1] downsampler (skip_down1_2)
         ])
         if image_encoder is not None:
-            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_7"] = torch.tensor([1.0])
         return inputs
 
     elif chunk_name == "SDXLLambdaUpblock":
@@ -1846,7 +1849,9 @@ def _get_architectural_chunk_sample_inputs(
             ("skip_2", torch.rand(batch_size, 320, h2, w2)),   # skip[3] from down_blocks[0] downsampler
         ])
         if image_encoder is not None:
-            inputs["ip_adapter_scale"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_8"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_9"] = torch.tensor([1.0])
+            inputs["ip_adapter_scale_block_10"] = torch.tensor([1.0])
         return inputs
 
     elif chunk_name == "SDXLKappaUpblock":
@@ -1938,7 +1943,7 @@ def chunk_unet(args, model_name=None):
                 # Fix: After chunking, the optional input flags are lost. So let's make the image prompt input optional again (if defined)
                 fix_optional_inputs(
                     dst_path,
-                    optional_input_names={"image_embeds", "additional_residual"},
+                    optional_input_names={"image_embeds", "additional_residual", "ip_adapter_scale_block"},
                 )
 
             # Delete original unet
