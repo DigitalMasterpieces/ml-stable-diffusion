@@ -202,8 +202,9 @@ public struct ControlNetUnionXLChunked: ResourceManaging, ControlNetXLProtocol {
 
         var outputs: [[String: MLShapedArray<Float32>]] = Array(repeating: [:], count: latents.count)
 
-        // Get conditioning scale (use first one if available)
-        guard let conditioningScale = conditioningScales.first?.first else {
+        // Early-out if all conditioning scales are zero (no ControlNet effect)
+        let allScalesZero = conditioningScales.first?.allSatisfy { $0 == 0.0 } ?? true
+        if allScalesZero {
             return outputs
         }
 
@@ -371,7 +372,31 @@ public struct ControlNetUnionXLChunked: ResourceManaging, ControlNetXLProtocol {
             }
         }
 
-        // Initialize missing outputs (shouldn't happen, but for safety)
+        // Output-level scaling (matching diffusers ControlNetUnionModel behavior).
+        // In the monolithic model, the final residuals are multiplied by conditioning_scale[0]
+        // ONLY when a single control type is active (len(control_type_idx) == 1).
+        // With multiple active types, BetaCondFusion handles per-type weighting internally.
+        // This scaling was lost during architectural chunking since it happens after all
+        // encoder blocks, outside of any individual chunk.
+        let nonZeroScales = conditioningScales.first?.filter { $0 > 0.0 } ?? []
+        let activeTypeCount = nonZeroScales.count
+
+        if activeTypeCount == 1, let effectiveScale = nonZeroScales.first, effectiveScale != 1.0 {
+            for n in 0..<outputs.count {
+                for key in outputs[n].keys {
+                    if let residual = outputs[n][key] {
+                        outputs[n][key] = MLShapedArray<Float32>(unsafeUninitializedShape: residual.shape) { ptr, _ in
+                            residual.withUnsafeShapedBufferPointer { src, _, _ in
+                                var scale = effectiveScale
+                                vDSP_vsmul(src.baseAddress!, 1, &scale, ptr.baseAddress!, 1, vDSP_Length(src.count))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Initialize missing outputs (shouldn't happen, but for safety).
         for (outputName, shape) in self.outputShapes[0] {
             for n in 0..<latents.count {
                 if outputs[n][outputName] == nil {

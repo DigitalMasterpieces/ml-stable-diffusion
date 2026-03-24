@@ -66,7 +66,8 @@ class SDXLAlphaEncoderBChunk(nn.Module):
         - emb: [B, 1280, 1, 1] time embedding (from AlphaEncoderA)
         - encoder_hidden_states: [B, 2048, 1, 77] text embeddings
         - image_embeds: [B, seq, dim] optional IP-Adapter embeddings
-        - ip_adapter_scale: [1] optional IP-Adapter scale
+        - ip_adapter_scale_block_0: [1] per-block IP-Adapter scale for down_blocks[1].attentions[0] (global index 0)
+        - ip_adapter_scale_block_1: [1] per-block IP-Adapter scale for down_blocks[1].attentions[1] (global index 1)
         - additional_residual_0 to _6: [optional] ControlNet residuals for conv_in + down_blocks[0,1]
 
     Outputs:
@@ -110,7 +111,8 @@ class SDXLAlphaEncoderBChunk(nn.Module):
         emb,
         encoder_hidden_states,
         image_embeds=None,
-        ip_adapter_scale=None,
+        ip_adapter_scale_block_0=None,
+        ip_adapter_scale_block_1=None,
         # ControlNet residuals for conv_in + down_blocks[0] + down_blocks[1]
         # Indices: 0=conv_in, 1-3=down_blocks[0], 4-6=down_blocks[1]
         additional_residual_0=None,
@@ -154,22 +156,11 @@ class SDXLAlphaEncoderBChunk(nn.Module):
         # DownBlock2D returns (hidden_states, output_states_tuple)
         # Note: SDXL down_blocks[0] is DownBlock2D (no attention), blocks 1,2 have attention
         if self.down_blocks_0_has_attn:
-            # Check if ip_adapter_scale is supported (custom UNet vs standard diffusers)
-            import inspect
-            sig = inspect.signature(self.down_blocks_0.forward)
-            if 'ip_adapter_scale' in sig.parameters:
-                sample, res_samples_0 = self.down_blocks_0(
-                    hidden_states=sample,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_blocks,
-                    ip_adapter_scale=ip_adapter_scale,
-                )
-            else:
-                sample, res_samples_0 = self.down_blocks_0(
-                    hidden_states=sample,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_blocks,
-                )
+            sample, res_samples_0 = self.down_blocks_0(
+                hidden_states=sample,
+                temb=emb,
+                encoder_hidden_states=encoder_hidden_states_for_blocks,
+            )
         else:
             sample, res_samples_0 = self.down_blocks_0(
                 hidden_states=sample,
@@ -187,22 +178,13 @@ class SDXLAlphaEncoderBChunk(nn.Module):
 
         # 4. Down block 1: 320->640 channels, produces 3 skips
         if self.down_blocks_1_has_attn:
-            # Check if ip_adapter_scale is supported (custom UNet vs standard diffusers)
-            import inspect
-            sig = inspect.signature(self.down_blocks_1.forward)
-            if 'ip_adapter_scale' in sig.parameters:
-                sample, res_samples_1 = self.down_blocks_1(
-                    hidden_states=sample,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_blocks,
-                    ip_adapter_scale=ip_adapter_scale,
-                )
-            else:
-                sample, res_samples_1 = self.down_blocks_1(
-                    hidden_states=sample,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_blocks,
-                )
+            ip_scale_blocks_1 = [ip_adapter_scale_block_0, ip_adapter_scale_block_1] if ip_adapter_scale_block_0 is not None else None
+            sample, res_samples_1 = self.down_blocks_1(
+                hidden_states=sample,
+                temb=emb,
+                encoder_hidden_states=encoder_hidden_states_for_blocks,
+                ip_adapter_scale_blocks=ip_scale_blocks_1,
+            )
         else:
             sample, res_samples_1 = self.down_blocks_1(
                 hidden_states=sample,
@@ -245,7 +227,7 @@ class SDXLGammaDownblockAChunk(nn.Module):
         - emb: [B, 1280, 1, 1]
         - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
         - ip_hidden_states: IP-Adapter image embeddings (optional)
-        - ip_adapter_scale: optional
+        - ip_adapter_scale_block_2: [1] per-block IP-Adapter scale for down_blocks[2].attentions[0] (global index 2)
         - additional_residual_7: [optional] ControlNet residual for down_blocks[2] layer 0
 
     Outputs:
@@ -267,7 +249,7 @@ class SDXLGammaDownblockAChunk(nn.Module):
         emb,
         encoder_hidden_states,
         ip_hidden_states=None,
-        ip_adapter_scale=None,
+        ip_adapter_scale_block_2=None,
         additional_residual_7=None,
     ):
         # Combine encoder_hidden_states and ip_hidden_states if IP-Adapter is enabled
@@ -280,7 +262,7 @@ class SDXLGammaDownblockAChunk(nn.Module):
         hidden = self.resnet_0(hidden, emb)
 
         # Attention 0
-        hidden = self.attn_0(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale=ip_adapter_scale)
+        hidden = self.attn_0(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale_block=ip_adapter_scale_block_2)
 
         # Skip connection = hidden + ControlNet residual (if present)
         # Main path hidden_out does NOT include ControlNet residual
@@ -304,7 +286,7 @@ class SDXLGammaDownblockBChunk(nn.Module):
         - emb: [B, 1280, 1, 1]
         - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
         - ip_hidden_states: IP-Adapter image embeddings (optional)
-        - ip_adapter_scale: optional
+        - ip_adapter_scale_block_3: [1] per-block IP-Adapter scale for down_blocks[2].attentions[1] (global index 3)
         - additional_residual_8: [optional] ControlNet residual for down_blocks[2] layer 1
 
     Outputs:
@@ -326,7 +308,7 @@ class SDXLGammaDownblockBChunk(nn.Module):
         emb,
         encoder_hidden_states,
         ip_hidden_states=None,
-        ip_adapter_scale=None,
+        ip_adapter_scale_block_3=None,
         additional_residual_8=None,
     ):
         # Combine encoder_hidden_states and ip_hidden_states if IP-Adapter is enabled
@@ -339,7 +321,7 @@ class SDXLGammaDownblockBChunk(nn.Module):
         hidden = self.resnet_1(hidden, emb)
 
         # Attention 1
-        hidden = self.attn_1(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale=ip_adapter_scale)
+        hidden = self.attn_1(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale_block=ip_adapter_scale_block_3)
 
         # Skip connection = hidden + ControlNet residual (if present)
         # Main path hidden_out does NOT include ControlNet residual
@@ -363,7 +345,7 @@ class SDXLSigmaCoreChunk(nn.Module):
         - emb: [B, 1280, 1, 1]
         - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
         - ip_hidden_states: IP-Adapter image embeddings (optional, for IP-Adapter)
-        - ip_adapter_scale: optional
+        - ip_adapter_scale_block_4: [1] per-block IP-Adapter scale for mid_block.attentions[0] (global index 4)
         - additional_residual_9: [optional] ControlNet residual for mid_block
 
     Outputs:
@@ -383,7 +365,7 @@ class SDXLSigmaCoreChunk(nn.Module):
         emb,
         encoder_hidden_states,
         ip_hidden_states=None,
-        ip_adapter_scale=None,
+        ip_adapter_scale_block_4=None,
         # ControlNet residual for mid_block (index 9 in the full sequence)
         additional_residual_9=None,
     ):
@@ -395,22 +377,12 @@ class SDXLSigmaCoreChunk(nn.Module):
             encoder_hidden_states_for_block = encoder_hidden_states
 
         if self.has_attention:
-            # Check if ip_adapter_scale is supported (custom UNet vs standard diffusers)
-            import inspect
-            sig = inspect.signature(self.mid_block.forward)
-            if 'ip_adapter_scale' in sig.parameters:
-                sample = self.mid_block(
-                    hidden_states=hidden,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_block,
-                    ip_adapter_scale=ip_adapter_scale,
-                )
-            else:
-                sample = self.mid_block(
-                    hidden_states=hidden,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_block,
-                )
+            sample = self.mid_block(
+                hidden_states=hidden,
+                temb=emb,
+                encoder_hidden_states=encoder_hidden_states_for_block,
+                ip_adapter_scale_block=ip_adapter_scale_block_4,
+            )
         else:
             sample = self.mid_block(
                 hidden_states=hidden,
@@ -444,7 +416,7 @@ class SDXLThetaUpblockAChunk(nn.Module):
         - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
         - ip_hidden_states: IP-Adapter image embeddings (optional)
         - skip_0: [B, 1280, H/4, W/4] from down_blocks[2] resnet 1 (skip_down2_1)
-        - ip_adapter_scale: optional
+        - ip_adapter_scale_block_5: [1] per-block IP-Adapter scale for up_blocks[0].attentions[0] (global index 5)
 
     Outputs:
         - hidden_out: [B, 1280, H/4, W/4] after first ResNet+Attention
@@ -464,7 +436,7 @@ class SDXLThetaUpblockAChunk(nn.Module):
         encoder_hidden_states,
         ip_hidden_states,
         skip_0,
-        ip_adapter_scale=None,
+        ip_adapter_scale_block_5=None,
     ):
         # Combine encoder_hidden_states and ip_hidden_states into tuple if IP-Adapter is enabled
         if self.support_image_prompt and ip_hidden_states is not None:
@@ -480,7 +452,7 @@ class SDXLThetaUpblockAChunk(nn.Module):
         hidden = self.resnet_0(hidden, emb)
 
         # Attention 0
-        hidden = self.attn_0(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale=ip_adapter_scale)
+        hidden = self.attn_0(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale_block=ip_adapter_scale_block_5)
 
         return (hidden,)
 
@@ -501,7 +473,7 @@ class SDXLThetaUpblockBChunk(nn.Module):
         - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
         - ip_hidden_states: IP-Adapter image embeddings (optional)
         - skip_0: [B, 1280, H/4, W/4] from down_blocks[2] resnet 0 (skip_down2_0)
-        - ip_adapter_scale: optional
+        - ip_adapter_scale_block_6: [1] per-block IP-Adapter scale for up_blocks[0].attentions[1] (global index 6)
 
     Outputs:
         - hidden_out: [B, 1280, H/4, W/4]
@@ -521,7 +493,7 @@ class SDXLThetaUpblockBChunk(nn.Module):
         encoder_hidden_states,
         ip_hidden_states,
         skip_0,
-        ip_adapter_scale=None,
+        ip_adapter_scale_block_6=None,
     ):
         # Combine encoder_hidden_states and ip_hidden_states into tuple if IP-Adapter is enabled
         if self.support_image_prompt and ip_hidden_states is not None:
@@ -533,7 +505,7 @@ class SDXLThetaUpblockBChunk(nn.Module):
         # hidden: [B, 1280, H/4, W/4], skip_0: [B, 1280, H/4, W/4] -> [B, 2560, H/4, W/4]
         hidden = torch.cat([hidden, skip_0], dim=1)
         hidden = self.resnet_1(hidden, emb)
-        hidden = self.attn_1(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale=ip_adapter_scale)
+        hidden = self.attn_1(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale_block=ip_adapter_scale_block_6)
 
         return (hidden,)
 
@@ -554,7 +526,7 @@ class SDXLThetaUpblockCChunk(nn.Module):
         - encoder_hidden_states: text embeddings [B, hidden, 1, seq_len]
         - ip_hidden_states: IP-Adapter image embeddings (optional)
         - skip_0: [B, 640, H/4, W/4] from down_blocks[1] downsampler (skip_down1_2)
-        - ip_adapter_scale: optional
+        - ip_adapter_scale_block_7: [1] per-block IP-Adapter scale for up_blocks[0].attentions[2] (global index 7)
 
     Outputs:
         - hidden_out: [B, 1280, H/2, W/2] upsampled output
@@ -575,7 +547,7 @@ class SDXLThetaUpblockCChunk(nn.Module):
         encoder_hidden_states,
         ip_hidden_states,
         skip_0,
-        ip_adapter_scale=None,
+        ip_adapter_scale_block_7=None,
     ):
         # Combine encoder_hidden_states and ip_hidden_states into tuple if IP-Adapter is enabled
         if self.support_image_prompt and ip_hidden_states is not None:
@@ -587,7 +559,7 @@ class SDXLThetaUpblockCChunk(nn.Module):
         # hidden: [B, 1280, H/4, W/4], skip_0: [B, 640, H/4, W/4] -> [B, 1920, H/4, W/4]
         hidden = torch.cat([hidden, skip_0], dim=1)
         hidden = self.resnet_2(hidden, emb)
-        hidden = self.attn_2(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale=ip_adapter_scale)
+        hidden = self.attn_2(hidden, context=encoder_hidden_states_for_attn, ip_adapter_scale_block=ip_adapter_scale_block_7)
 
         # Upsample: [B, 1280, H/4, W/4] -> [B, 1280, H/2, W/2]
         hidden = self.upsampler(hidden)
@@ -611,7 +583,9 @@ class SDXLLambdaUpblockChunk(nn.Module):
         - skip_0: [B, 640, H/2, W/2] from down_blocks[1] resnet 1
         - skip_1: [B, 640, H/2, W/2] from down_blocks[1] resnet 0
         - skip_2: [B, 320, H/2, W/2] from down_blocks[0] downsampler
-        - ip_adapter_scale: optional
+        - ip_adapter_scale_block_8: [1] per-block IP-Adapter scale for up_blocks[1].attentions[0] (global index 8)
+        - ip_adapter_scale_block_9: [1] per-block IP-Adapter scale for up_blocks[1].attentions[1] (global index 9)
+        - ip_adapter_scale_block_10: [1] per-block IP-Adapter scale for up_blocks[1].attentions[2] (global index 10)
 
     Outputs:
         - hidden: [B, 640, H, W] upsampled output
@@ -632,7 +606,9 @@ class SDXLLambdaUpblockChunk(nn.Module):
         skip_0,
         skip_1,
         skip_2,
-        ip_adapter_scale=None,
+        ip_adapter_scale_block_8=None,
+        ip_adapter_scale_block_9=None,
+        ip_adapter_scale_block_10=None,
     ):
         # emb is [B, 1280, 1, 1] - custom unet.py ResnetBlock2D expects 4D temb for Conv2d
         # Combine encoder_hidden_states and ip_hidden_states into tuple if IP-Adapter is enabled
@@ -644,24 +620,14 @@ class SDXLLambdaUpblockChunk(nn.Module):
         res_hidden_states_tuple = (skip_2, skip_1, skip_0)
 
         if self.has_attention:
-            # Check if ip_adapter_scale is supported (custom UNet vs standard diffusers)
-            import inspect
-            sig = inspect.signature(self.up_blocks_1.forward)
-            if 'ip_adapter_scale' in sig.parameters:
-                sample = self.up_blocks_1(
-                    hidden_states=hidden,
-                    res_hidden_states_tuple=res_hidden_states_tuple,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_block,
-                    ip_adapter_scale=ip_adapter_scale,
-                )
-            else:
-                sample = self.up_blocks_1(
-                    hidden_states=hidden,
-                    res_hidden_states_tuple=res_hidden_states_tuple,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states_for_block,
-                )
+            ip_scale_blocks = [ip_adapter_scale_block_8, ip_adapter_scale_block_9, ip_adapter_scale_block_10] if ip_adapter_scale_block_8 is not None else None
+            sample = self.up_blocks_1(
+                hidden_states=hidden,
+                res_hidden_states_tuple=res_hidden_states_tuple,
+                temb=emb,
+                encoder_hidden_states=encoder_hidden_states_for_block,
+                ip_adapter_scale_blocks=ip_scale_blocks,
+            )
         else:
             sample = self.up_blocks_1(
                 hidden_states=hidden,

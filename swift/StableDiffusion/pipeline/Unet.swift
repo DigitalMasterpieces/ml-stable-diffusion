@@ -204,7 +204,7 @@ public struct Unet: ResourceManaging {
         geometryConditioning: MLShapedArray<Float32>,
         additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil,
         imageEmbeds: MLShapedArray<Float32>? = nil,
-        ipAdapterScale: Float? = 1.0,
+        ipAdapterBlockScales: [Float]? = nil,
         reduceMemory: Bool = false
     ) throws -> [MLShapedArray<Float32>] {
         // Determine chunk mode for signpost message.
@@ -242,9 +242,11 @@ public struct Unet: ResourceManaging {
                     dict[k] = MLMultiArray(v)
                 }
             }
-            if let ipAdapterScale = ipAdapterScale {
-                let ipAdapterScaleArray = MLShapedArray<Float32>(scalars: [Float(ipAdapterScale)],shape: [1])
-                dict["ip_adapter_scale"] = MLMultiArray(ipAdapterScaleArray)
+            if let blockScales = ipAdapterBlockScales {
+                for (index, scale) in blockScales.enumerated() {
+                    let scaleArray = MLShapedArray<Float32>(scalars: [scale], shape: [1])
+                    dict["ip_adapter_scale_block_\(index)"] = MLMultiArray(scaleArray)
+                }
             }
             if let imageEmbeds = imageEmbeds {
                 dict["image_embeds"] = MLMultiArray(imageEmbeds)

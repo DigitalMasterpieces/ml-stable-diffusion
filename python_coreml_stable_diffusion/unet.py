@@ -67,9 +67,8 @@ class AttnProcessor2_0(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.ip_adapter_scale_additional = 1.0
 
-    def forward(self, attn, hidden_states, context=None, mask=None, ip_adapter_scale=None):
+    def forward(self, attn, hidden_states, context=None, mask=None, ip_adapter_scale_block=None):
         batch_size, dim, _, sequence_length = hidden_states.shape
 
         q = attn.to_q(hidden_states)
@@ -120,11 +119,9 @@ class IPAdapterAttnProcessor2_0(nn.Module):
             [nn.Conv2d(cross_attention_dim, hidden_size, kernel_size=1, bias=False) for _ in range(len(num_tokens))]
         )
 
-        self.ip_adapter_scale_additional = torch.tensor([1.0])
-
-    def forward(self, attn, hidden_states, context=None, mask=None, ip_adapter_scale=None):
-        if ip_adapter_scale is None:
-            ip_adapter_scale = torch.ones(1, device=hidden_states.device, dtype=hidden_states.dtype)
+    def forward(self, attn, hidden_states, context=None, mask=None, ip_adapter_scale_block=None):
+        if ip_adapter_scale_block is None:
+            ip_adapter_scale_block = torch.ones(1, device=hidden_states.device, dtype=hidden_states.dtype)
 
         q = attn.to_q(hidden_states)
 
@@ -153,8 +150,7 @@ class IPAdapterAttnProcessor2_0(nn.Module):
 
                 attn_image = attn.einsum(q, ip_key, ip_value, mask)
 
-                # assume ip_adapter_scale is a tensor scalar now, e.g. shape [1]
-                scale_tensor = ip_adapter_scale * self.ip_adapter_scale_additional
+                scale_tensor = ip_adapter_scale_block
 
                 # expand/broadcast to attn_image shape
                 scale_tensor_expanded = scale_tensor.expand_as(attn_image)
@@ -199,8 +195,8 @@ class CrossAttention(nn.Module):
             nn.Conv2d(inner_dim, query_dim, kernel_size=1, bias=True))
         self.einsum = Einsum(self.heads, self.dim_head)
 
-    def forward(self, hidden_states, context=None, mask=None, ip_adapter_scale=None):
-        return self.processor(self, hidden_states, context, mask, ip_adapter_scale)
+    def forward(self, hidden_states, context=None, mask=None, ip_adapter_scale_block=None):
+        return self.processor(self, hidden_states, context, mask, ip_adapter_scale_block=ip_adapter_scale_block)
 
     def get_processor(self):
         return self.processor
@@ -308,15 +304,16 @@ class CrossAttnUpBlock2D(nn.Module):
                 res_hidden_states_tuple,
                 temb=None,
                 encoder_hidden_states=None,
-                ip_adapter_scale=None):
-        for resnet, attn in zip(self.resnets, self.attentions):
+                ip_adapter_scale_blocks=None):
+        for i, (resnet, attn) in enumerate(zip(self.resnets, self.attentions)):
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
             hidden_states = torch.cat([hidden_states, res_hidden_states],
                                       dim=1)
 
             hidden_states = resnet(hidden_states, temb)
-            hidden_states = attn(hidden_states, context=encoder_hidden_states, ip_adapter_scale=ip_adapter_scale)
+            block_scale = ip_adapter_scale_blocks[i] if ip_adapter_scale_blocks is not None else None
+            hidden_states = attn(hidden_states, context=encoder_hidden_states, ip_adapter_scale_block=block_scale)
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
@@ -436,12 +433,13 @@ class CrossAttnDownBlock2D(nn.Module):
         else:
             self.downsamplers = None
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, ip_adapter_scale=None):
+    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, ip_adapter_scale_blocks=None):
         output_states = ()
 
-        for resnet, attn in zip(self.resnets, self.attentions):
+        for i, (resnet, attn) in enumerate(zip(self.resnets, self.attentions)):
             hidden_states = resnet(hidden_states, temb)
-            hidden_states = attn(hidden_states, context=encoder_hidden_states, ip_adapter_scale=ip_adapter_scale)
+            block_scale = ip_adapter_scale_blocks[i] if ip_adapter_scale_blocks is not None else None
+            hidden_states = attn(hidden_states, context=encoder_hidden_states, ip_adapter_scale_block=block_scale)
             output_states += (hidden_states, )
 
         if self.downsamplers is not None:
@@ -658,14 +656,14 @@ class SpatialTransformer(nn.Module):
                                   stride=1,
                                   padding=0)
 
-    def forward(self, hidden_states, context=None, ip_adapter_scale=None):
+    def forward(self, hidden_states, context=None, ip_adapter_scale_block=None):
         batch, channel, height, weight = hidden_states.shape
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         hidden_states = self.proj_in(hidden_states)
         hidden_states = hidden_states.view(batch, channel, 1, height * weight)
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, context=context, ip_adapter_scale=ip_adapter_scale)
+            hidden_states = block(hidden_states, context=context, ip_adapter_scale_block=ip_adapter_scale_block)
         hidden_states = hidden_states.view(batch, channel, height, weight)
         hidden_states = self.proj_out(hidden_states)
         return hidden_states + residual
@@ -695,10 +693,11 @@ class BasicTransformerBlock(nn.Module):
         self.norm2 = LayerNormANE(dim)
         self.norm3 = LayerNormANE(dim)
 
-    def forward(self, hidden_states, context=None, ip_adapter_scale=None):
+    def forward(self, hidden_states, context=None, ip_adapter_scale_block=None):
         hidden_states = self.attn1(self.norm1(hidden_states)) + hidden_states
         hidden_states = self.attn2(self.norm2(hidden_states),
-                                   context=context, ip_adapter_scale=ip_adapter_scale) + hidden_states
+                                   context=context,
+                                   ip_adapter_scale_block=ip_adapter_scale_block) + hidden_states
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
         return hidden_states
 
@@ -901,10 +900,10 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, ip_adapter_scale=None):
+    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, ip_adapter_scale_block=None):
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
-            hidden_states = attn(hidden_states, encoder_hidden_states, ip_adapter_scale=ip_adapter_scale)
+            hidden_states = attn(hidden_states, encoder_hidden_states, ip_adapter_scale_block=ip_adapter_scale_block)
             hidden_states = resnet(hidden_states, temb)
 
         return hidden_states
@@ -1190,7 +1189,6 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
         time_ids,
         text_embeds,
         image_embeds,
-        ip_adapter_scale,
         *additional_residuals,
     ):
         # 0. Project time embeddings
@@ -1241,8 +1239,7 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
                     temb=emb,
-                    encoder_hidden_states=encoder_hidden_states,
-                    ip_adapter_scale=ip_adapter_scale)
+                    encoder_hidden_states=encoder_hidden_states)
             else:
                 sample, res_samples = downsample_block(hidden_states=sample,
                                                        temb=emb)
@@ -1259,8 +1256,7 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
         # 4. mid
         sample = self.mid_block(sample,
                                 emb,
-                                encoder_hidden_states=encoder_hidden_states,
-                                ip_adapter_scale=ip_adapter_scale)
+                                encoder_hidden_states=encoder_hidden_states)
 
         if self.support_controlnet:
             sample = sample + additional_residuals[-1]
@@ -1278,7 +1274,6 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
                     temb=emb,
                     res_hidden_states_tuple=res_samples,
                     encoder_hidden_states=encoder_hidden_states,
-                    ip_adapter_scale=ip_adapter_scale
                 )
             else:
                 sample = upsample_block(hidden_states=sample,
@@ -1310,7 +1305,7 @@ class UNet2DConditionModelXLWithoutIPAdapter(nn.Module):
         text_embeds,
         *additional_residuals
     ):
-        return self.model(sample, timestep, encoder_hidden_states, time_ids, text_embeds, None, 0.0, *additional_residuals)
+        return self.model(sample, timestep, encoder_hidden_states, time_ids, text_embeds, None, *additional_residuals)
 
 
 def get_down_block(

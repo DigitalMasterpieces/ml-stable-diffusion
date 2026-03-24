@@ -174,21 +174,27 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
                     let result = results.features(at: n)
                     for k in result.featureNames {
                         let newValue = result.featureValue(for: k)!.multiArrayValue!
+                        outputs[n][k] = MLShapedArray<Float32>(converting: newValue)
+                    }
+                }
+            }
+        }
 
-                        let count = newValue.count
-                        let inputPointer = newValue.dataPointer.assumingMemoryBound(to: Float.self)
-
-                        // Accumulate scaled values into outputs.
-                        let scaledArray = try! MLMultiArray(shape: newValue.shape, dataType: .float32)
-                        let scaledPointer = scaledArray.dataPointer.assumingMemoryBound(to: Float.self)
-
-                        // Direct scaling into MLMultiArray memory.
-                        vDSP_vsmul(inputPointer, 1,
-                                   [1.0], // conditioningScale
-                                    scaledPointer, 1,
-                                    vDSP_Length(count))
-
-                        outputs[n][k] = MLShapedArray<Float32>(scaledArray)
+        // Output scaling: match diffusers behavior where final residuals are multiplied
+        // by conditioning_scale[0] when a single control type is active.
+        // With multiple active types, BetaCondFusion handles per-type weighting internally.
+        let nonZeroScales = conditioningScales.first?.filter { $0 > 0.0 } ?? []
+        let activeTypeCount = nonZeroScales.count
+        if activeTypeCount == 1, let effectiveScale = nonZeroScales.first, effectiveScale != 1.0 {
+            for n in 0..<outputs.count {
+                for key in outputs[n].keys {
+                    if let residual = outputs[n][key] {
+                        outputs[n][key] = MLShapedArray<Float32>(unsafeUninitializedShape: residual.shape) { ptr, _ in
+                            residual.withUnsafeShapedBufferPointer { src, _, _ in
+                                var scale = effectiveScale
+                                vDSP_vsmul(src.baseAddress!, 1, &scale, ptr.baseAddress!, 1, vDSP_Length(src.count))
+                            }
+                        }
                     }
                 }
             }
