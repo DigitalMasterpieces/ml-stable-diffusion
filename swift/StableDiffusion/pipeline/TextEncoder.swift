@@ -3,6 +3,7 @@
 
 import Foundation
 import CoreML
+import os
 
 @available(iOS 16.2, macOS 13.1, *)
 public protocol TextEncoderModel: ResourceManaging {
@@ -63,12 +64,16 @@ public struct TextEncoder: TextEncoderModel {
     ///     - text: Input text to be tokenized and then embedded
     ///  - Returns: Embedding representing the input text
     public func encode(_ text: String) throws -> MLShapedArray<Float32> {
+        let encodeState = signposter.beginInterval("Encode Text")
+        defer { signposter.endInterval("Encode Text", encodeState) }
 
         // Get models expected input length
         let inputLength = inputShape.last!
 
         // Tokenize with prompt weights, padding to the expected length
-        var (tokens, ids, weights) = tokenizer.tokenizeWithWeights(text, minCount: inputLength)
+        var (tokens, ids, weights) = signposter.withIntervalSignpost("Tokenize") {
+            tokenizer.tokenizeWithWeights(text, minCount: inputLength)
+        }
 
         // Truncate if necessary
         if ids.count > inputLength {
@@ -95,8 +100,11 @@ public struct TextEncoder: TextEncoderModel {
         let inputFeatures = try! MLDictionaryFeatureProvider(
             dictionary: [inputName: MLMultiArray(inputArray)])
 
-        let result = try model.perform { model in
-            try model.prediction(from: inputFeatures)
+        // Run CoreML model inference.
+        let result = try signposter.withIntervalSignpost("Text Encoder Predict") {
+            try model.perform { model in
+                try model.prediction(from: inputFeatures)
+            }
         }
 
         let embeddingFeature = result.featureValue(for: "last_hidden_state")
@@ -104,6 +112,8 @@ public struct TextEncoder: TextEncoderModel {
 
         // Apply prompt weights to embeddings
         if let weights {
+            let weightsState = signposter.beginInterval("Apply Prompt Weights")
+
             let shape = textEmbeddings.shape  // [1, 77, dim]
             let previousMean = textEmbeddings.scalars.withUnsafeBufferPointer { buffer in
                 buffer.reduce(0, +)
@@ -133,6 +143,8 @@ public struct TextEncoder: TextEncoderModel {
                     }
                 }
             }
+
+            signposter.endInterval("Apply Prompt Weights", weightsState)
         }
 
         return textEmbeddings
@@ -148,4 +160,9 @@ public struct TextEncoder: TextEncoderModel {
         inputDescription.multiArrayConstraint!.shape.map { $0.intValue }
     }
 
+}
+
+@available(iOS 17.4, macOS 14.4, *)
+extension TextEncoder: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { [self.model] }
 }

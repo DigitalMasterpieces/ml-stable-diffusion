@@ -4,6 +4,7 @@
 
 import Foundation
 import CoreML
+import os
 
 /// U-Net noise prediction model for stable diffusion
 @available(iOS 16.2, macOS 13.1, *)
@@ -133,6 +134,8 @@ public struct Unet: ResourceManaging {
         hiddenStates: MLShapedArray<Float32>,
         additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
     ) throws -> [MLShapedArray<Float32>] {
+        let noiseState = signposter.beginInterval("Predict Noise")
+        defer { signposter.endInterval("Predict Noise", noiseState) }
 
         // Match time step batch dimension to the model / latent samples
         let t: MLShapedArray<Float32>
@@ -204,6 +207,16 @@ public struct Unet: ResourceManaging {
         ipAdapterBlockScales: [Float]? = nil,
         reduceMemory: Bool = false
     ) throws -> [MLShapedArray<Float32>] {
+        // Determine chunk mode for signpost message.
+        let noiseState: OSSignpostIntervalState
+        if models.count == 4 {
+            noiseState = signposter.beginInterval("Predict Noise", "quad")
+        } else if models.count == 11 {
+            noiseState = signposter.beginInterval("Predict Noise", "architectural")
+        } else {
+            noiseState = signposter.beginInterval("Predict Noise", "single")
+        }
+        defer { signposter.endInterval("Predict Noise", noiseState) }
 
         // Match time step batch dimension to the model / latent samples
         // Infer batch size from hiddenStates shape (batch size 2 for CFG, 1 for no CFG)
@@ -293,8 +306,10 @@ public extension Array where Element == ManagedMLModel {
         var stageOutputs: [[[String: MLFeatureValue]]] = []   // cache outputs of all stages
 
         // --- Stage 0 ---
-        var results = try self.first!.perform { model in
-            try model.predictions(fromBatch: batch)
+        var results = try signposter.withIntervalSignpost("UNet Stage", "Stage 0/4") {
+            try self.first!.perform { model in
+                try model.predictions(fromBatch: batch)
+            }
         }
         stageOutputs.append(results.arrayOfFeatureValueDictionaries)
 
@@ -302,28 +317,31 @@ public extension Array where Element == ManagedMLModel {
         for (stageIndex, stage) in self.dropFirst().enumerated() {
             let actualIndex = stageIndex + 1   // because dropFirst shifts indices
 
-            // Build merged inputs for this stage
-            let mergedInputDicts: [[String: MLFeatureValue]] =
-                (0..<inputs.count).map { sampleIndex in
-                    var merged = inputs[sampleIndex]   // start with original input
+            results = try signposter.withIntervalSignpost("UNet Stage", "Stage \(actualIndex)/4") {
+                // Build merged inputs for this stage
+                let mergedInputDicts: [[String: MLFeatureValue]] =
+                    (0..<inputs.count).map { sampleIndex in
+                        var merged = inputs[sampleIndex]   // start with original input
 
-                    // merge outputs of all dependencies (in order)
-                    for dep in dependencies[actualIndex] {
-                        let depDict = stageOutputs[dep][sampleIndex]
-                        for (k, v) in depDict { merged[k] = v }
+                        // merge outputs of all dependencies (in order)
+                        for dep in dependencies[actualIndex] {
+                            let depDict = stageOutputs[dep][sampleIndex]
+                            for (k, v) in depDict { merged[k] = v }
+                        }
+                        return merged
                     }
-                    return merged
+
+                let providers = try mergedInputDicts.map {
+                    try MLDictionaryFeatureProvider(dictionary: $0)
                 }
+                let nextBatch = MLArrayBatchProvider(array: providers)
 
-            let providers = try mergedInputDicts.map {
-                try MLDictionaryFeatureProvider(dictionary: $0)
+                // predict
+                return try stage.perform { model in
+                    try model.predictions(fromBatch: nextBatch)
+                }
             }
-            let nextBatch = MLArrayBatchProvider(array: providers)
 
-            // predict
-            results = try stage.perform { model in
-                try model.predictions(fromBatch: nextBatch)
-            }
             stageOutputs.append(results.arrayOfFeatureValueDictionaries)
         }
 
@@ -386,9 +404,12 @@ public extension Array where Element == ManagedMLModel {
         var stageOutputs: [[[String: MLFeatureValue]]] = []
 
         // --- Stage 0 (AlphaEncoderA) ---
-        var results = try self.first!.perform { model in
-            try model.predictions(fromBatch: batch)
+        var results = try signposter.withIntervalSignpost("UNet Stage", "AlphaEncoderA") {
+            try self.first!.perform { model in
+                try model.predictions(fromBatch: batch)
+            }
         }
+
         // Unload model to free ANE/GPU memory (outputs are retained in stageOutputs)
         if reduceMemory {
             self.first!.unloadResources()
@@ -402,35 +423,38 @@ public extension Array where Element == ManagedMLModel {
 
                 let skipMap = stageSkipMappings[actualIndex] ?? [:]
 
-                let mergedInputDicts: [[String: MLFeatureValue]] =
-                    (0..<inputs.count).map { sampleIndex in
-                        var merged = inputs[sampleIndex]
+                results = try signposter.withIntervalSignpost("UNet Stage", "\(actualIndex)/11") {
+                    let mergedInputDicts: [[String: MLFeatureValue]] =
+                        (0..<inputs.count).map { sampleIndex in
+                            var merged = inputs[sampleIndex]
 
-                        for dep in dependencies[actualIndex] {
-                            let depDict = stageOutputs[dep][sampleIndex]
-                            for (outputName, value) in depDict {
-                                if let inputName = skipMap[outputName] {
-                                    merged[inputName] = value
-                                }
-                                else if let inputName = outputToInputNameMap[outputName] {
-                                    merged[inputName] = value
-                                }
-                                else {
-                                    merged[outputName] = value
+                            for dep in dependencies[actualIndex] {
+                                let depDict = stageOutputs[dep][sampleIndex]
+                                for (outputName, value) in depDict {
+                                    if let inputName = skipMap[outputName] {
+                                        merged[inputName] = value
+                                    }
+                                    else if let inputName = outputToInputNameMap[outputName] {
+                                        merged[inputName] = value
+                                    }
+                                    else {
+                                        merged[outputName] = value
+                                    }
                                 }
                             }
+                            return merged
                         }
-                        return merged
+
+                    let providers = try mergedInputDicts.map {
+                        try MLDictionaryFeatureProvider(dictionary: $0)
                     }
+                    let nextBatch = MLArrayBatchProvider(array: providers)
 
-                let providers = try mergedInputDicts.map {
-                    try MLDictionaryFeatureProvider(dictionary: $0)
+                    return try stage.perform { model in
+                        try model.predictions(fromBatch: nextBatch)
+                    }
                 }
-                let nextBatch = MLArrayBatchProvider(array: providers)
 
-                results = try stage.perform { model in
-                    try model.predictions(fromBatch: nextBatch)
-                }
                 // Unload model to free ANE/GPU memory (outputs are retained in stageOutputs)
                 if reduceMemory {
                     stage.unloadResources()
@@ -441,5 +465,10 @@ public extension Array where Element == ManagedMLModel {
 
         return results
     }
+}
+
+@available(iOS 17.4, macOS 14.4, *)
+extension Unet: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { self.models }
 }
 

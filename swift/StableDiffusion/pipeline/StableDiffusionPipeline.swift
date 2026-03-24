@@ -7,6 +7,7 @@ import CoreGraphics
 import CoreML
 import Foundation
 import NaturalLanguage
+import os
 
 /// Schedulers compatible with StableDiffusionPipeline
 public enum StableDiffusionScheduler {
@@ -235,6 +236,9 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
     public func loadResources(progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+        let loadState = signposter.beginInterval("Load Resources")
+        defer { signposter.endInterval("Load Resources", loadState) }
+
         let loadModels: [ResourceManaging]
         let prewarmModels: [ResourceManaging]
         if reduceMemory {
@@ -268,8 +272,15 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         configuration config: Configuration,
         progressHandler: (PipelineProgress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
+        let generateState = signposter.beginInterval(
+            "Generate Images",
+
+            "\(config.stepCount, privacy: .public) steps"
+        )
+        defer { signposter.endInterval("Generate Images", generateState) }
 
         // Encode the input prompt
+        let encodeState = signposter.beginInterval("Encode Prompt")
         var promptEmbedding = try textEncoder.encode(config.prompt)
 
         if config.useCFG {
@@ -281,6 +292,8 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                 alongAxis: 0
             )
         }
+
+        signposter.endInterval("Encode Prompt", encodeState)
 
         if reduceMemory {
             textEncoder.unloadResources()
@@ -323,7 +336,18 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 
         // De-noising loop
         let timeSteps: [Double] = scheduler[0].calculateTimesteps(strength: timestepStrength)
+        let denoiseLoopState = signposter.beginInterval(
+            "Denoise Loop",
+
+            "\(timeSteps.count, privacy: .public) steps"
+        )
+
         for (step,t) in timeSteps.enumerated() {
+            let stepState = signposter.beginInterval(
+                "Denoise Step",
+    
+                "\(step + 1, privacy: .public)/\(timeSteps.count, privacy: .public)"
+            )
 
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
@@ -343,7 +367,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                 hiddenStates: hiddenStates,
                 images: controlNetConds
             )
-            
+
             // Predict noise residuals from latent samples
             // and current time step conditioned on hidden states
             var noise : [MLShapedArray<Float32>]
@@ -380,11 +404,14 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             }
 
             if config.useCFG {
-                noise = performGuidance(noise, config.guidanceScale)
+                noise = signposter.withIntervalSignpost("Guidance") {
+                    performGuidance(noise, config.guidanceScale)
+                }
             }
 
             // Have the scheduler compute the previous (t-1) latent
             // sample given the predicted noise and current sample
+            let schedulerStepState = signposter.beginInterval("Scheduler Step")
             for i in 0..<config.imageCount {
                 latents[i] = scheduler[i].step(
                     output: noise[i],
@@ -394,6 +421,9 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 
                 denoisedLatents[i] = scheduler[i].modelOutputs.last ?? latents[i]
             }
+            signposter.endInterval("Scheduler Step", schedulerStepState)
+
+            signposter.endInterval("Denoise Step", stepState)
 
             let currentLatentSamples = config.useDenoisedIntermediates ? denoisedLatents : latents
 
@@ -409,9 +439,12 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             )
             if !progressHandler(progress) {
                 // Stop if requested by handler
+                signposter.endInterval("Denoise Loop", denoiseLoopState)
                 return []
             }
         }
+
+        signposter.endInterval("Denoise Loop", denoiseLoopState)
 
         if reduceMemory {
             controlNet?.unloadResources()
@@ -419,7 +452,9 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         }
 
         // Decode the latent samples to images
-        return try decodeToImages(denoisedLatents, configuration: config)
+        return try signposter.withIntervalSignpost("Decode Images") {
+            try decodeToImages(denoisedLatents, configuration: config)
+        }
     }
 
     func generateLatentSamples(configuration config: Configuration, scheduler: Scheduler) throws -> [MLShapedArray<Float32>] {
@@ -477,9 +512,10 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 public struct PipelineProgress {
     /// The current phase of image generation
     public enum Phase {
-        case encoding      // Text/image encoding before denoising
-        case denoising     // Main denoising loop
-        case decoding      // VAE decoding at the end
+        case encoding          // Text/image encoding before denoising
+        case readyToDenoise    // After encoding, before denoising loop
+        case denoising         // Main denoising loop
+        case decoding          // VAE decoding at the end
     }
 
     public let pipeline: StableDiffusionPipelineProtocol
@@ -583,5 +619,28 @@ extension StableDiffusionPipeline {
         }
 
         return root
+    }
+}
+
+// MARK: - ComputePlanProviding
+
+@available(iOS 17.4, macOS 14.4, *)
+extension StableDiffusionPipeline: ComputePlanProviding {
+    public var computePlans: [ComputePlanEntry] {
+        get async throws {
+            var entries: [ComputePlanEntry] = []
+
+            // Protocol existential needs casting.
+            if let provider = textEncoder as? ComputePlanProviding {
+                entries += try await provider.computePlans
+            }
+
+            // Concrete types conform directly.
+            entries += try await self.unet.computePlans
+            entries += try await self.decoder.computePlans
+            if let encoder { entries += try await encoder.computePlans }
+            if let safetyChecker { entries += try await safetyChecker.computePlans }
+            return entries
+        }
     }
 }
