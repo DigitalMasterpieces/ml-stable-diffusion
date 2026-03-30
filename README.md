@@ -25,7 +25,7 @@ This fork extends Apple's original `ml-stable-diffusion` with the following feat
 
 - **Architectural UNet Chunking** (`--unet-chunks architectural`): Splits the SDXL UNet into 11 semantically meaningful chunks at architectural boundaries (encoder blocks, mid block, decoder blocks) with explicit skip connections, optimized for Neural Engine deployment on iOS/iPadOS.
 - **ControlNet Union** (`--convert-controlnet` with Union models, `--controlnet-chunk-mode architectural`): Supports multi-control-type Union ControlNet models (e.g. `brad-twinkl/controlnet-union-sdxl-1.0-promax`) that handle canny, depth, pose, etc. in a single model. Can also be split into architectural chunks for mobile.
-- **IP-Adapter** (`--load-ip-adapter`, `--ip-scales`): Integrates IP-Adapter into the UNet at conversion time for image-prompted generation. Per-block scale control allows fine-tuning which attention layers receive the image prompt.
+- **IP-Adapter** (`--load-ip-adapter`, `--ip-scales`): Integrates IP-Adapter into the UNet at conversion time for image-prompted generation. Per-block scale control via 11 attention block scales (`--ip-adapter-block-scales`) allows fine-tuning which layers receive the image prompt.
 - **Image Encoder** (`--convert-image-encoder`): Converts the CLIP image encoder needed by IP-Adapter.
 - **Tiled VAE** (`--vae-tiled`, `--vae-tile-latent-size`): Converts VAE encoder/decoder with tiled input shapes for high-resolution generation (1024x1024+) on memory-constrained devices using the Neural Engine.
 - **No-CFG UNet** (`--unet-batch-one`): Converts the UNet with batch size 1 for distilled models (SDXL Lightning, LCM) that do not require Classifier-Free Guidance.
@@ -40,11 +40,11 @@ This fork extends Apple's original `ml-stable-diffusion` with the following feat
   - Escaped brackets: `\(`, `\)`, `\[`, `\]`
   - Per-token weights are applied to text embeddings with mean-factor normalization to preserve overall magnitude.
 - **ControlNet Union (SDXL)**: Full pipeline support for Union ControlNet models with per-control-type conditioning scales and type masks. Includes a chunked variant for ANE deployment.
-- **IP-Adapter (SDXL)**: Image-prompted generation via `ipAdapterScale` configuration and an image encoder model.
+- **IP-Adapter (SDXL)**: Image-prompted generation via `ipAdapterBlockScales` configuration (per-block scales for 11 attention blocks) and an image encoder model.
 - **Tiled VAE Encoding/Decoding**: Configurable tile-based VAE processing (`TilingConfiguration`) to run the VAE on the Neural Engine at high resolutions without exceeding memory limits. Uses optimized `vDSP_mmov`-based tile stitching.
 - **Disable Classifier-Free Guidance** (`--no-use-cfg`): For distilled models like SDXL Lightning that generate high-quality images in 1-4 steps without CFG. Reduces UNet inference to batch size 1 for faster generation.
 - **New Schedulers**: `euler` (Discrete Euler, matching HuggingFace `EulerDiscreteScheduler`) and `flow` (Discrete Flow for SD3/Flux-style models).
-- **IP-Adapter Scale** (`--ip-adapter-scale`): Controls the influence of the IP-Adapter image prompt (0.0 to disable).
+- **IP-Adapter Per-Block Scales** (`--ip-adapter-block-scales`): Comma-separated scales for the 11 IP-Adapter attention blocks (0.0 to disable individual blocks).
 - **ControlNet Union Flag** (`--controlnet-union`): Activates Union mode for SDXL ControlNet.
 - **Progress Tracking**: All pipelines (SD 1.x, SDXL, SD3) report granular model loading progress via Foundation's `Progress` API with per-component child progress.
 
@@ -504,7 +504,7 @@ swift run StableDiffusionSample <prompt> --resource-path <output-mlpackages-dire
 - Only the `base` model is required, `refiner` model is optional and will be used by default if provided in the resource directory
 - ControlNet and ControlNet Union are supported for SDXL (use `--controlnet` and `--controlnet-union` flags)
 - For distilled models (SDXL Lightning, LCM), use `--no-use-cfg` to disable Classifier-Free Guidance
-- Use `--ip-adapter-scale <0.0-1.0>` to control IP-Adapter image prompt influence
+- Use `--ip-adapter-block-scales <comma-separated>` to control per-block IP-Adapter scales (11 values for attention blocks, e.g. `1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0`)
 - Use `--scheduler euler` for Euler scheduling or `--scheduler flow` for flow-based models
 
 ### Python Inference
@@ -807,7 +807,7 @@ Please use the `--help` flag to learn about batched generation and more.
 | `--disable-safety` | Flag | `false` | Disable the safety checker |
 | `--reduce-memory` | Flag | `false` | Load/unload models just-in-time to reduce peak memory |
 | `--use-cfg` / `--no-use-cfg` | Flag | `true` | Enable/disable Classifier-Free Guidance. Use `--no-use-cfg` for distilled models (SDXL Lightning, LCM). |
-| `--ip-adapter-scale` | Float | `1.0` | IP-Adapter image prompt influence (0.0 to disable) |
+| `--ip-adapter-block-scales` | String | `nil` | Comma-separated per-block IP-Adapter scales for 11 attention blocks (0.0 to disable individual blocks) |
 | `--use-multilingual-text-encoder` | Flag | `false` | Use system NLContextualEmbedding as text encoder |
 | `--script` | Enum | `latin` | Script for multilingual contextual embedding |
 
@@ -859,7 +859,7 @@ var pipelineConfig = StableDiffusionPipeline.Configuration(prompt: "a (beautiful
 pipelineConfig.stepCount = 4
 pipelineConfig.useCFG = false              // For SDXL Lightning
 pipelineConfig.schedulerType = .discreteEulerScheduler
-pipelineConfig.ipAdapterScale = 0.7        // IP-Adapter influence
+pipelineConfig.ipAdapterBlockScales = Array(repeating: 0.7, count: 11) // Per-block IP-Adapter scales
 pipelineConfig.tilingConfig = .default      // Tiled VAE for high-res
 
 // Generate
