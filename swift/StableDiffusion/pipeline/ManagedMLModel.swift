@@ -76,23 +76,24 @@ public final class ManagedMLModel: Sendable {
     /// - Returns: The result of the closure
     /// - Throws: An error if the model cannot be loaded or if the closure throws
     public func perform<R>(_ body: (MLModel) throws -> R) throws -> R {
-        // Note: The previous DispatchQueue implementation wrapped this in autoreleasepool
-        // to drain CoreML ObjC intermediates. Mutex.withLock's `inout sending` parameter
-        // is incompatible with nested closures like autoreleasepool in Swift 6 strict
-        // concurrency. ObjC intermediates still drain at the caller's autorelease pool
-        // boundary (typically each denoising step), so peak memory impact is minimal.
-        try state.withLock { loadedModel in
-            if loadedModel == nil {
-                let loadState = signposter.beginInterval(
-                    "Load Model",
-                    "\(self.modelURL.lastPathComponent, privacy: .public)"
-                )
-                defer { signposter.endInterval("Load Model", loadState) }
+        // Drain CoreML ObjC intermediates after each prediction to limit peak memory
+        // during tight denoising loops. The pool wraps the lock rather than nesting inside
+        // it, because Mutex.withLock's task-isolated closure prevents nested closures in
+        // Swift 6 strict concurrency.
+        try autoreleasepool {
+            try state.withLock { loadedModel in
+                if loadedModel == nil {
+                    let loadState = signposter.beginInterval(
+                        "Load Model",
+                        "\(self.modelURL.lastPathComponent, privacy: .public)"
+                    )
+                    defer { signposter.endInterval("Load Model", loadState) }
 
-                let resolvedURL = self.modelURL.resolvingSymlinksInPath()
-                loadedModel = try MLModel(contentsOf: resolvedURL, configuration: self.configuration)
+                    let resolvedURL = self.modelURL.resolvingSymlinksInPath()
+                    loadedModel = try MLModel(contentsOf: resolvedURL, configuration: self.configuration)
+                }
+                return try body(loadedModel!)
             }
-            return try body(loadedModel!)
         }
     }
 
