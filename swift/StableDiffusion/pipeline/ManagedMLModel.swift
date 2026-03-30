@@ -6,10 +6,12 @@
 import os
 import Synchronization
 
-/// A class to manage and gate access to a Core ML model.
+/// Manages loading and access to a single Core ML model.
 ///
-/// It will automatically load a model into memory when needed or requested.
-/// It allows one to request to unload the model from memory.
+/// The caller is responsible for compiling model sources (`.mlpackage` / `.mlmodel`) to
+/// `.mlmodelc` bundles before passing the URL to this class. `ManagedMLModel` loads
+/// compiled models directly via `MLModel(contentsOf:)` and does not perform any
+/// compilation or caching itself.
 ///
 /// Thread safety is provided by `Mutex`, which protects all access to the loaded model.
 /// This keeps the API synchronous — important because CoreML predictions (`MLModel.prediction(from:)`)
@@ -29,7 +31,8 @@ public final class ManagedMLModel: Sendable {
     /// Create a managed model given its location and desired loaded configuration
     ///
     /// - Parameters:
-    ///     - url: The location of the model
+    ///     - url: URL of a compiled `.mlmodelc` bundle (or a symlink to one).
+    ///       Source formats like `.mlpackage` are not supported — compile them first.
     ///     - configuration: The configuration to be used when the model is loaded/used
     /// - Returns: A managed model that has not been loaded
     public init(modelAt url: URL, configuration: MLModelConfiguration) {
