@@ -10,7 +10,8 @@ import CoreML
 public struct MultilingualTextEncoder: TextEncoderModel {
     let adapter: ManagedMLModel?
 
-    let embeddingModel: NLContextualEmbedding
+    /// Created at init time and only accessed synchronously through this struct's methods.
+    nonisolated(unsafe) let embeddingModel: NLContextualEmbedding
 
     // TODO: use maximum sequence length from embedding.
     let maximumEmbeddingSequenceLength = 256

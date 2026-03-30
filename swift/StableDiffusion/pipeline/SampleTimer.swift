@@ -18,8 +18,11 @@ import Foundation
 /// print(String(format: "mean: %.2f, var: %.2f",
 ///              timer.mean, timer.variance))
 /// ```
+/// **Sendable safety invariant:** `SampleTimer` is only used from a single thread within the
+/// synchronous pipeline generation callback. The `@unchecked Sendable` allows it to cross
+/// the `@Sendable` closure boundary without actual concurrent access.
 @available(iOS 16.2, macOS 13.1, *)
-public final class SampleTimer: Codable {
+public final class SampleTimer: @unchecked Sendable, Codable {
     var startTime: CFAbsoluteTime?
     var sum: Double = 0.0
     var sumOfSquares: Double = 0.0

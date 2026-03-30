@@ -116,7 +116,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     ///
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
-    public func loadResources(progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+    public func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) async throws {
         let loadState = signposter.beginInterval("Load Resources")
         defer { signposter.endInterval("Load Resources", loadState) }
 
@@ -130,7 +130,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             prewarmModels = [unetRefiner].compactMap{ $0 as? ResourceManaging }
         }
 
-        try self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
+        try await self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
     }
 
 
@@ -155,7 +155,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     ///            The images will be nil if safety checks were performed and found the result to be un-safe
     public func generateImages(
         configuration config: Configuration,
-        progressHandler: (PipelineProgress) -> Bool = { _ in true }
+        progressHandler: @Sendable (PipelineProgress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
         let generateState = signposter.beginInterval(
             "Generate Images",

@@ -16,12 +16,12 @@ public struct TextEncoderT5Output {
     public let encoderHiddenStates: MLShapedArray<Float32>
 }
 
-///  A model for encoding text, suitable for SD3
+/// A model for encoding text, suitable for SD3.
 @available(iOS 17.0, macOS 14.0, *)
 public struct TextEncoderT5: TextEncoderT5Model {
 
     /// Text tokenizer
-    var tokenizer: Tokenizer
+    let tokenizer: Tokenizer
 
     /// Embedding model
     var model: ManagedMLModel

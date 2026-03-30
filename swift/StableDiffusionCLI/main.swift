@@ -12,7 +12,7 @@ import CoreImage
 import NaturalLanguage
 
 @available(iOS 16.2, macOS 13.1, *)
-struct StableDiffusionSample: ParsableCommand {
+struct StableDiffusionSample: AsyncParsableCommand {
 
     static let configuration = CommandConfiguration(
         abstract: "Run stable diffusion to generate images guided by a text prompt",
@@ -113,7 +113,7 @@ struct StableDiffusionSample: ParsableCommand {
     @Option(help: "The natural language script for the multilingual contextual embedding")
     var script: Script = .latin
 
-    mutating func run() throws {
+    mutating func run() async throws {
         guard FileManager.default.fileExists(atPath: resourcePath) else {
             throw RunError.resources("Resource path does not exist \(resourcePath)")
         }
@@ -178,7 +178,7 @@ struct StableDiffusionSample: ParsableCommand {
         }
 
         let loadProgress = pipeline.makeLoadProgress()
-        try pipeline.loadResources(progress: loadProgress, onProgress: { fraction in
+        try await pipeline.loadResources(progress: loadProgress, onProgress: { fraction in
             print("Loading: \(Int(fraction * 100))%")
         })
         
@@ -236,10 +236,13 @@ struct StableDiffusionSample: ParsableCommand {
         pipelineConfig.decoderShiftFactor = shiftFactor
         pipelineConfig.schedulerTimestepShift = timestepShift
 
+        // The progress handler runs synchronously within generateImages, so capturing
+        // self and sampleTimer is safe. Use nonisolated(unsafe) to satisfy the @Sendable requirement.
+        nonisolated(unsafe) let handler = self
         let images = try pipeline.generateImages(
             configuration: pipelineConfig) { progress in
                 sampleTimer.stop()
-                handleProgress(progress,sampleTimer)
+                handler.handleProgress(progress, sampleTimer)
                 if progress.stepCount != progress.step {
                     sampleTimer.start()
                 }
@@ -385,7 +388,7 @@ enum RNGOption: String, ExpressibleByArgument {
 }
 
 @available(iOS 16.2, macOS 13.1, *)
-extension Script: @retroactive ExpressibleByArgument {}
+extension Script: ExpressibleByArgument {}
 
 if #available(iOS 16.2, macOS 13.1, *) {
     StableDiffusionSample.main()

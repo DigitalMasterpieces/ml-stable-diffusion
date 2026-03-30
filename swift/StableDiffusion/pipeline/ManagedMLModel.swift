@@ -2,8 +2,9 @@
 // Copyright (C) 2022 Apple Inc. All Rights Reserved.
 // Copyright (C) 2026 Digital Masterpieces GmbH. All Rights Reserved.
 
-import CoreML
+@preconcurrency import CoreML
 import os
+import Synchronization
 
 /// Manages loading and access to a single Core ML model.
 ///
@@ -11,20 +12,21 @@ import os
 /// `.mlmodelc` bundles before passing the URL to this class. `ManagedMLModel` loads
 /// compiled models directly via `MLModel(contentsOf:)` and does not perform any
 /// compilation or caching itself.
+///
+/// Thread safety is provided by `Mutex`, which protects all access to the loaded model.
+/// This keeps the API synchronous — important because CoreML predictions (`MLModel.prediction(from:)`)
+/// are sync-only and can block for 100-280ms per call.
 @available(iOS 16.2, macOS 13.1, *)
-public final class ManagedMLModel {
+public final class ManagedMLModel: Sendable {
 
     /// The location of the model
-    var modelURL: URL
+    let modelURL: URL
 
     /// The configuration to be used when the model is loaded
-    var configuration: MLModelConfiguration
+    let configuration: MLModelConfiguration
 
-    /// The loaded model (when loaded)
-    var loadedModel: MLModel?
-
-    /// Queue to protect access to loaded model
-    var queue: DispatchQueue
+    /// The loaded model state, protected by a Mutex.
+    private let state: Mutex<MLModel?>
 
     /// Create a managed model given its location and desired loaded configuration
     ///
@@ -35,21 +37,31 @@ public final class ManagedMLModel {
     /// - Returns: A managed model that has not been loaded
     public init(modelAt url: URL, configuration: MLModelConfiguration) {
         self.modelURL = url
-        self.configuration = configuration
-        self.loadedModel = nil
-        self.queue = DispatchQueue(label: "managed.\(url.lastPathComponent)")
+        // Defensive copy: MLModelConfiguration is a reference type, so the caller could
+        // mutate it after init. Copying ensures our configuration is stable.
+        self.configuration = configuration.copy() as! MLModelConfiguration
+        self.state = Mutex(nil)
     }
 
     /// Instantiation and load model into memory
     public func loadResources(progress: Progress) throws {
-        try queue.sync {
-            try loadModel()
+        try state.withLock { loadedModel in
+            if loadedModel != nil { return }
+
+            let loadState = signposter.beginInterval(
+                "Load Model",
+                "\(self.modelURL.lastPathComponent, privacy: .public)"
+            )
+            defer { signposter.endInterval("Load Model", loadState) }
+
+            let resolvedURL = self.modelURL.resolvingSymlinksInPath()
+            loadedModel = try MLModel(contentsOf: resolvedURL, configuration: self.configuration)
         }
     }
 
     /// Unload the model if it was loaded
     public func unloadResources() {
-        queue.sync {
+        state.withLock { loadedModel in
             loadedModel = nil
             signposter.emitEvent("Unload Model", "\(self.modelURL.lastPathComponent, privacy: .public)")
         }
@@ -64,9 +76,22 @@ public final class ManagedMLModel {
     /// - Returns: The result of the closure
     /// - Throws: An error if the model cannot be loaded or if the closure throws
     public func perform<R>(_ body: (MLModel) throws -> R) throws -> R {
-        return try queue.sync {
-            try autoreleasepool {
-                try loadModel()
+        // Drain CoreML ObjC intermediates after each prediction to limit peak memory
+        // during tight denoising loops. The pool wraps the lock rather than nesting inside
+        // it, because Mutex.withLock's task-isolated closure prevents nested closures in
+        // Swift 6 strict concurrency.
+        try autoreleasepool {
+            try state.withLock { loadedModel in
+                if loadedModel == nil {
+                    let loadState = signposter.beginInterval(
+                        "Load Model",
+                        "\(self.modelURL.lastPathComponent, privacy: .public)"
+                    )
+                    defer { signposter.endInterval("Load Model", loadState) }
+
+                    let resolvedURL = self.modelURL.resolvingSymlinksInPath()
+                    loadedModel = try MLModel(contentsOf: resolvedURL, configuration: self.configuration)
+                }
                 return try body(loadedModel!)
             }
         }
@@ -83,22 +108,6 @@ public final class ManagedMLModel {
         get async throws {
             try await MLComputePlan.load(contentsOf: self.modelURL, configuration: self.configuration)
         }
-    }
-
-    // MARK: - Private
-
-    private func loadModel() throws {
-        if loadedModel != nil { return }
-
-        let loadState = signposter.beginInterval(
-            "Load Model",
-            "\(self.modelURL.lastPathComponent, privacy: .public)"
-        )
-        defer { signposter.endInterval("Load Model", loadState) }
-
-        // Resolve symlinks (e.g. stable-name symlinks from the build system), then load.
-        let resolvedURL = modelURL.resolvingSymlinksInPath()
-        loadedModel = try MLModel(contentsOf: resolvedURL, configuration: configuration)
     }
 }
 
