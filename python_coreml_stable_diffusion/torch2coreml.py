@@ -199,10 +199,13 @@ def quantize_weights(args):
     for model_name in ["text_encoder", "text_encoder_2", "image_encoder", "unet", "refiner"]:
         logger.info(f"Quantizing {model_name} to {args.quantize_nbits}-bit precision")
         out_path = _get_out_path(args, model_name)
+        # unet has optional ip_adapter_scale_block_* inputs that need restoring
+        restore = controlnet_optional_inputs if model_name == "unet" else None
         _quantize_weights(
             out_path,
             model_name,
-            args.quantize_nbits
+            args.quantize_nbits,
+            restore_optional_inputs=restore
         )
 
     # control-unet has optional ControlNet residual inputs and image_embeds
@@ -233,11 +236,8 @@ def quantize_weights(args):
     if is_architectural:
         from python_coreml_stable_diffusion.unet_architectural_chunks import ARCHITECTURAL_CHUNK_NAMES
 
-        # Determine which chunks have optional ControlNet inputs
-        # AlphaEncoder: additional_residual_0 through _6, image_embeds
-        # GammaDownblock: additional_residual_7, _8
-        # SigmaCore: additional_residual_9
-        chunks_with_controlnet = {
+        # Determine which chunks have optional inputs (ControlNet residuals, image_embeds, ip_adapter_scale_block_*)
+        chunks_with_optional_inputs = {
             "SDXLAlphaEncoderB": ["additional_residual", "image_embeds", "ip_adapter_scale_block"],
             "SDXLGammaDownblockA": ["additional_residual", "ip_adapter_scale_block"],
             "SDXLGammaDownblockB": ["additional_residual", "ip_adapter_scale_block"],
@@ -251,7 +251,7 @@ def quantize_weights(args):
         for chunk_name in ARCHITECTURAL_CHUNK_NAMES:
             logger.info(f"Quantizing architectural chunk {chunk_name} to {args.quantize_nbits}-bit precision")
             out_path = _get_out_path(args, chunk_name)
-            restore_inputs = chunks_with_controlnet.get(chunk_name, None)
+            restore_inputs = chunks_with_optional_inputs.get(chunk_name, None)
             _quantize_weights(
                 out_path,
                 chunk_name,
@@ -1453,6 +1453,8 @@ def convert_unet(pipe, args, model_name=None):
             # Loop over all inputs in the model description
             for input_type in spec.description.input:
                 if input_type.name == "image_embeds":
+                    input_type.type.isOptional = True
+                if input_type.name.startswith("ip_adapter_scale_block"):
                     input_type.type.isOptional = True
 
             # Update model
