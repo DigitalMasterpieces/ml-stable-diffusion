@@ -5,6 +5,7 @@
 import Foundation
 import CoreML
 import Accelerate
+import os
 
 @available(iOS 16.2, macOS 13.1, *)
 public struct ControlNet: ResourceManaging {
@@ -87,6 +88,9 @@ public struct ControlNet: ResourceManaging {
         hiddenStates: MLShapedArray<Float32>,
         images: [MLShapedArray<Float32>]
     ) throws -> [[String: MLShapedArray<Float32>]] {
+        let executeState = signposter.beginInterval("ControlNet Execute")
+        defer { signposter.endInterval("ControlNet Execute", executeState) }
+
         // Match time step batch dimension to the model / latent samples
         let t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
 
@@ -107,8 +111,10 @@ public struct ControlNet: ResourceManaging {
 
             outputs = initOutputs(batch: latents.count, shapes: outputShapes[modelIndex])
 
-            let results = try model.perform {
-                try $0.predictions(fromBatch: batch)
+            let results = try signposter.withIntervalSignpost("ControlNet Predict", "Model \(modelIndex, privacy: .public)") {
+                try model.perform {
+                    try $0.predictions(fromBatch: batch)
+                }
             }
 
             for n in 0..<results.count {

@@ -4,6 +4,7 @@
 
 import Foundation
 import CoreML
+import os
 
 @available(iOS 17.0, macOS 14.0, *)
 public protocol ImageEncoderXLModel: ResourceManaging {
@@ -75,6 +76,9 @@ public struct ImageEncoderXL: ImageEncoderXLModel {
     ///     - text: Input text to be tokenized and then embedded
     ///  - Returns: Embedding representing the input text
     public func encode(_ image: CGImage) throws -> ImageEncoderXLOutput {
+        let encodeState = signposter.beginInterval("Encode Image")
+        defer { signposter.endInterval("Encode Image", encodeState) }
+
         let imageData = try image.planarRGBShapedArray(minValue: 0.0, maxValue: 1.0)
         guard imageData.shape == self.inputShape else {
             // TODO: Consider auto resizing and croping similar to how Vision or CoreML auto-generated Swift code can accomplish with `MLFeatureValue`
@@ -83,8 +87,11 @@ public struct ImageEncoderXL: ImageEncoderXLModel {
         let dict = [self.inputName: MLMultiArray(imageData)]
         let input = try MLDictionaryFeatureProvider(dictionary: dict)
 
-        let result = try model.perform { model in
-            try model.prediction(from: input)
+        // Run CoreML model inference.
+        let result = try signposter.withIntervalSignpost("Image Encoder Predict") {
+            try model.perform { model in
+                try model.prediction(from: input)
+            }
         }
 
         let outputName = result.featureNames.first!
@@ -105,4 +112,9 @@ public struct ImageEncoderXL: ImageEncoderXLModel {
     var inputShape: [Int] {
         inputDescription.multiArrayConstraint!.shape.map { $0.intValue }
     }
+}
+
+@available(iOS 17.4, macOS 14.4, *)
+extension ImageEncoderXL: ComputePlanProviding, ManagedModelProviding {
+    public var managedModels: [ManagedMLModel] { [self.model] }
 }

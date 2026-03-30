@@ -7,6 +7,7 @@ import CoreGraphics
 import CoreML
 import Foundation
 import NaturalLanguage
+import os
 
 
 /// A pipeline used to generate image samples from text input using stable diffusion XL
@@ -106,7 +107,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         if let unetRefiner = unetRefiner { add(unetRefiner.loadProgressWeights.reduce(0, +)) }
         if let encoder = encoder { add(encoder.loadProgressWeights.reduce(0, +)) }
         if let controlNet = controlNet { add(controlNet.loadProgressWeights.reduce(0, +)) }
-        if let safetyChecker = safetyChecker { add(safetyChecker.loadProgressWeights.reduce(0, +)) }
+        // SafetyChecker is excluded from eager loading — it loads lazily on first use.
 
         return [totalUnits]
     }
@@ -115,18 +116,21 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     ///
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
-    public func loadResources(progress: Progress, onProgress: ((Double) -> Void)? = nil) throws {
+    public func loadResources(progress: Progress, onProgress: (@Sendable (Double) -> Void)? = nil) async throws {
+        let loadState = signposter.beginInterval("Load Resources")
+        defer { signposter.endInterval("Load Resources", loadState) }
+
         let loadModels: [ResourceManaging]
         let prewarmModels: [ResourceManaging]
         if reduceMemory {
             loadModels = []
-            prewarmModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, unetRefiner, encoder, controlNet, safetyChecker].compactMap{ $0 as? ResourceManaging }
+            prewarmModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, unetRefiner, encoder, controlNet].compactMap{ $0 as? ResourceManaging }
         } else {
-            loadModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, encoder, controlNet, safetyChecker].compactMap{ $0 as ResourceManaging? }
+            loadModels = [textEncoder2, imageEncoder, unet, decoder, textEncoder, encoder, controlNet].compactMap{ $0 as ResourceManaging? }
             prewarmModels = [unetRefiner].compactMap{ $0 as? ResourceManaging }
         }
 
-        try self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
+        try await self.loadModels(loadModels: loadModels, prewarmModels: prewarmModels, progress: progress, onProgress: onProgress)
     }
 
 
@@ -151,8 +155,14 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     ///            The images will be nil if safety checks were performed and found the result to be un-safe
     public func generateImages(
         configuration config: Configuration,
-        progressHandler: (PipelineProgress) -> Bool = { _ in true }
+        progressHandler: @Sendable (PipelineProgress) -> Bool = { _ in true }
     ) throws -> [CGImage?] {
+        let generateState = signposter.beginInterval(
+            "Generate Images",
+
+            "\(config.stepCount, privacy: .public) steps"
+        )
+        defer { signposter.endInterval("Generate Images", generateState) }
 
         // Determine input type of Unet
         // SDXL Refiner has a latentTimeIdShape of [2, 5]
@@ -179,13 +189,17 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         // Check if the first textEncoder is available, which is required for base models
         if textEncoder != nil {
-            baseInput = try generateConditioning(using: config, forRefiner: isRefiner)
+            baseInput = try signposter.withIntervalSignpost("Encode Prompt", "base") {
+                try generateConditioning(using: config, forRefiner: isRefiner)
+            }
         }
 
         // Check if the imageEncoder is available
         if let imageEncoder = self.imageEncoder {
             if let imageInput = config.imageInput {
-                imageInputEmbeddings = try imageEncoder.encode(imageInput)
+                imageInputEmbeddings = try signposter.withIntervalSignpost("Encode Image") {
+                    try imageEncoder.encode(imageInput)
+                }
                 ipAdapterBlockScales = config.ipAdapterBlockScales
             } else {
                 ipAdapterBlockScales = Array(repeating: 0.0, count: 11)
@@ -194,7 +208,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         // Check if the refiner unet exists, or if the current unet is a refiner
         if unetRefiner != nil || isRefiner {
-            refinerInput = try generateConditioning(using: config, forRefiner: true)
+            refinerInput = try signposter.withIntervalSignpost("Encode Prompt", "refiner") {
+                try generateConditioning(using: config, forRefiner: true)
+            }
         }
 
         if reduceMemory {
@@ -202,6 +218,18 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             textEncoder2.unloadResources()
             imageEncoder?.unloadResources()
         }
+
+        // Report that encoding is complete and denoising is about to begin.
+        let readyProgress = PipelineProgress(
+            pipeline: self,
+            prompt: config.prompt,
+            step: 0,
+            stepCount: config.stepCount,
+            currentLatentSamples: [],
+            configuration: config,
+            phase: .readyToDenoise
+        )
+        if !progressHandler(readyProgress) { return [] }
 
         /// Setup schedulers
         let scheduler: [Scheduler] = (0..<config.imageCount).map { _ in
@@ -271,7 +299,19 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         let refinerStartStep = Int(Float(timeSteps.count) * config.refinerStart)
 
         // De-noising loop
+        let denoiseLoopState = signposter.beginInterval(
+            "Denoise Loop",
+
+            "\(timeSteps.count, privacy: .public) steps"
+        )
+
         for (step,t) in timeSteps.enumerated() {
+            let stepState = signposter.beginInterval(
+                "Denoise Step",
+    
+                "\(step + 1, privacy: .public)/\(timeSteps.count, privacy: .public)"
+            )
+
             // Expand the latents for classifier-free guidance (if using CFG)
             // and input to the Unet noise prediction model
             var latentUnetInput: [MLShapedArray<Float32>]
@@ -309,6 +349,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             // Execute ControlNet if present, converting empty results to nil
             // to avoid subscript crashes in Unet when no ControlNet images provided.
             var additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
+            let controlNetState: OSSignpostIntervalState? = controlNet != nil
+                ? signposter.beginInterval("ControlNet")
+                : nil
             if let controlNetResult = try controlNet?.execute(
                 latents: latentUnetInput,
                 timeStep: t,
@@ -321,6 +364,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             ), !controlNetResult.isEmpty {
                 additionalResiduals = controlNetResult
             }
+            if let s = controlNetState { signposter.endInterval("ControlNet", s) }
 
             // Predict noise residuals from latent samples
             // and current time step conditioned on hidden states
@@ -338,20 +382,26 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
             // Only perform guidance when CFG is enabled
             if config.useCFG {
-                noise = performGuidance(noise, config.guidanceScale)
+                noise = signposter.withIntervalSignpost("Guidance") {
+                    performGuidance(noise, config.guidanceScale)
+                }
             }
 
             // Have the scheduler compute the previous (t-1) latent
             // sample given the predicted noise and current sample
+            let schedulerStepState = signposter.beginInterval("Scheduler Step")
             for i in 0..<config.imageCount {
                 latents[i] = scheduler[i].step(
                     output: noise[i],
                     timeStep: t,
                     sample: latents[i]
                 )
-                
+
                 denoisedLatents[i] = scheduler[i].modelOutputs.last ?? latents[i]
             }
+            signposter.endInterval("Scheduler Step", schedulerStepState)
+
+            signposter.endInterval("Denoise Step", stepState)
 
             let currentLatentSamples = config.useDenoisedIntermediates ? denoisedLatents : latents
 
@@ -367,9 +417,12 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
             )
             if !progressHandler(progress) {
                 // Stop if requested by handler
+                signposter.endInterval("Denoise Loop", denoiseLoopState)
                 return []
             }
         }
+
+        signposter.endInterval("Denoise Loop", denoiseLoopState)
 
         // Unload resources
         if reduceMemory {
@@ -391,7 +444,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         _ = progressHandler(decodingProgress)
 
         // Decode the latent samples to images
-        return try decodeToImages(denoisedLatents, configuration: config)
+        return try signposter.withIntervalSignpost("Decode Images") {
+            try decodeToImages(denoisedLatents, configuration: config)
+        }
     }
 
     func encodePrompt(_ prompt: String, forRefiner: Bool = false) throws -> (MLShapedArray<Float32>, MLShapedArray<Float32>) {
@@ -647,11 +702,38 @@ extension StableDiffusionXLPipeline {
             root.addTrackedChild(controlNetProgress, units: controlNetProgress.totalUnitCount)
         }
 
-        if let safetyChecker = safetyChecker {
-            let safetyCheckerProgress = safetyChecker.makeLoadProgress()
-            root.addTrackedChild(safetyCheckerProgress, units: safetyCheckerProgress.totalUnitCount)
-        }
+        // SafetyChecker is excluded — it loads lazily on first use.
 
         return root
+    }
+}
+
+// MARK: - ComputePlanProviding
+
+@available(iOS 17.4, macOS 14.4, *)
+extension StableDiffusionXLPipeline: ComputePlanProviding {
+    public var computePlans: [ComputePlanEntry] {
+        get async throws {
+            var entries: [ComputePlanEntry] = []
+
+            // Protocol existentials need casting to ComputePlanProviding.
+            if let provider = textEncoder as? ComputePlanProviding {
+                entries += try await provider.computePlans
+            }
+            if let provider = textEncoder2 as? ComputePlanProviding {
+                entries += try await provider.computePlans
+            }
+            if let provider = imageEncoder as? ComputePlanProviding {
+                entries += try await provider.computePlans
+            }
+
+            // Concrete types conform directly.
+            entries += try await self.unet.computePlans
+            if let unetRefiner { entries += try await unetRefiner.computePlans }
+            entries += try await self.decoder.computePlans
+            if let encoder { entries += try await encoder.computePlans }
+            if let safetyChecker { entries += try await safetyChecker.computePlans }
+            return entries
+        }
     }
 }

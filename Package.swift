@@ -1,4 +1,4 @@
-// swift-tools-version: 5.8
+// swift-tools-version: 6.2
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -6,8 +6,8 @@ import PackageDescription
 let package = Package(
     name: "stable-diffusion",
     platforms: [
-        .macOS(.v13),
-        .iOS(.v16),
+        .macOS(.v15),
+        .iOS(.v18),
     ],
     products: [
         .library(
@@ -18,8 +18,8 @@ let package = Package(
             targets: ["StableDiffusionCLI"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.2.3"),
-        .package(url: "https://github.com/huggingface/swift-transformers.git", exact: "0.1.8"),
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.7.0"),
+        .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.2.0"),
     ],
     targets: [
         .target(
@@ -27,13 +27,15 @@ let package = Package(
             dependencies:  [
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
-            path: "swift/StableDiffusion"),
+            path: "swift/StableDiffusion",
+            swiftSettings: [.swiftLanguageMode(.v6)]),
         .executableTarget(
             name: "StableDiffusionCLI",
             dependencies: [
                 "StableDiffusion",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")],
-            path: "swift/StableDiffusionCLI"),
+            path: "swift/StableDiffusionCLI",
+            swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(
             name: "StableDiffusionTests",
             dependencies: ["StableDiffusion"],
@@ -41,6 +43,7 @@ let package = Package(
             resources: [
                 .copy("Resources/vocab.json"),
                 .copy("Resources/merges.txt")
-            ]),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]),
     ]
 )

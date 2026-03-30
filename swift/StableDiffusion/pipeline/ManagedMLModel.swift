@@ -2,52 +2,68 @@
 // Copyright (C) 2022 Apple Inc. All Rights Reserved.
 // Copyright (C) 2026 Digital Masterpieces GmbH. All Rights Reserved.
 
-import CoreML
-import CryptoKit
+@preconcurrency import CoreML
+import os
+import Synchronization
 
-/// A class to manage and gate access to a Core ML model
+/// Manages loading and access to a single Core ML model.
 ///
-/// It will automatically load a model into memory when needed or requested
-/// It allows one to request to unload the model from memory
+/// The caller is responsible for compiling model sources (`.mlpackage` / `.mlmodel`) to
+/// `.mlmodelc` bundles before passing the URL to this class. `ManagedMLModel` loads
+/// compiled models directly via `MLModel(contentsOf:)` and does not perform any
+/// compilation or caching itself.
+///
+/// Thread safety is provided by `Mutex`, which protects all access to the loaded model.
+/// This keeps the API synchronous — important because CoreML predictions (`MLModel.prediction(from:)`)
+/// are sync-only and can block for 100-280ms per call.
 @available(iOS 16.2, macOS 13.1, *)
-public final class ManagedMLModel {
+public final class ManagedMLModel: Sendable {
 
     /// The location of the model
-    var modelURL: URL
+    let modelURL: URL
 
     /// The configuration to be used when the model is loaded
-    var configuration: MLModelConfiguration
+    let configuration: MLModelConfiguration
 
-    /// The loaded model (when loaded)
-    var loadedModel: MLModel?
-
-    /// Queue to protect access to loaded model
-    var queue: DispatchQueue
+    /// The loaded model state, protected by a Mutex.
+    private let state: Mutex<MLModel?>
 
     /// Create a managed model given its location and desired loaded configuration
     ///
     /// - Parameters:
-    ///     - url: The location of the model
+    ///     - url: URL of a compiled `.mlmodelc` bundle (or a symlink to one).
+    ///       Source formats like `.mlpackage` are not supported — compile them first.
     ///     - configuration: The configuration to be used when the model is loaded/used
     /// - Returns: A managed model that has not been loaded
     public init(modelAt url: URL, configuration: MLModelConfiguration) {
         self.modelURL = url
-        self.configuration = configuration
-        self.loadedModel = nil
-        self.queue = DispatchQueue(label: "managed.\(url.lastPathComponent)")
+        // Defensive copy: MLModelConfiguration is a reference type, so the caller could
+        // mutate it after init. Copying ensures our configuration is stable.
+        self.configuration = configuration.copy() as! MLModelConfiguration
+        self.state = Mutex(nil)
     }
 
     /// Instantiation and load model into memory
     public func loadResources(progress: Progress) throws {
-        try queue.sync {
-            try loadModel()
+        try state.withLock { loadedModel in
+            if loadedModel != nil { return }
+
+            let loadState = signposter.beginInterval(
+                "Load Model",
+                "\(self.modelURL.lastPathComponent, privacy: .public)"
+            )
+            defer { signposter.endInterval("Load Model", loadState) }
+
+            let resolvedURL = self.modelURL.resolvingSymlinksInPath()
+            loadedModel = try MLModel(contentsOf: resolvedURL, configuration: self.configuration)
         }
     }
 
     /// Unload the model if it was loaded
     public func unloadResources() {
-        queue.sync {
+        state.withLock { loadedModel in
             loadedModel = nil
+            signposter.emitEvent("Unload Model", "\(self.modelURL.lastPathComponent, privacy: .public)")
         }
     }
 
@@ -60,114 +76,38 @@ public final class ManagedMLModel {
     /// - Returns: The result of the closure
     /// - Throws: An error if the model cannot be loaded or if the closure throws
     public func perform<R>(_ body: (MLModel) throws -> R) throws -> R {
-        return try queue.sync {
-            try autoreleasepool {
-                try loadModel()
+        // Drain CoreML ObjC intermediates after each prediction to limit peak memory
+        // during tight denoising loops. The pool wraps the lock rather than nesting inside
+        // it, because Mutex.withLock's task-isolated closure prevents nested closures in
+        // Swift 6 strict concurrency.
+        try autoreleasepool {
+            try state.withLock { loadedModel in
+                if loadedModel == nil {
+                    let loadState = signposter.beginInterval(
+                        "Load Model",
+                        "\(self.modelURL.lastPathComponent, privacy: .public)"
+                    )
+                    defer { signposter.endInterval("Load Model", loadState) }
+
+                    let resolvedURL = self.modelURL.resolvingSymlinksInPath()
+                    loadedModel = try MLModel(contentsOf: resolvedURL, configuration: self.configuration)
+                }
                 return try body(loadedModel!)
             }
         }
     }
 
-    /// Compute hash for a model at `modelURL`.
-    func cacheKey(for modelURL: URL) -> String {
-        let data = try! Data(contentsOf: modelURL)
-        let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        return modelURL.deletingPathExtension().lastPathComponent + "_" + hash
-    }
+    // MARK: - Compute Plan
 
-    /// Compute hash for a packaged model at `url`.
-    func cacheDirectoryKey(for url: URL) -> String {
-        let fm = FileManager.default
-        let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: nil)!
-
-        var hasher = SHA256()
-
-        for case let fileURL as URL in enumerator {
-            if (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
-                continue
-            }
-            if let data = try? Data(contentsOf: fileURL) {
-                hasher.update(data: data)
-            }
+    /// Loads the compute plan for this model using its URL and configuration.
+    ///
+    /// Requires `loadResources` or `perform` to have been called first so that the model
+    /// is available.
+    @available(iOS 17.4, macOS 14.4, *)
+    public var computePlan: MLComputePlan {
+        get async throws {
+            try await MLComputePlan.load(contentsOf: self.modelURL, configuration: self.configuration)
         }
-
-        let digest = hasher.finalize()
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    private func loadModel() throws {
-        if loadedModel != nil { return }
-
-        // If already pointing at a compiled .mlmodelc bundle, load directly
-        // (resolving symlinks that ModelCompiler may have created).
-        if modelURL.pathExtension == "mlmodelc" {
-            let resolvedURL = modelURL.resolvingSymlinksInPath()
-            loadedModel = try MLModel(contentsOf: resolvedURL, configuration: configuration)
-            return
-        }
-
-        let fm = FileManager.default
-
-        // Create persistent cache folder.
-        let supportDir = try fm.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let cacheDir = supportDir.appendingPathComponent("CompiledModels", isDirectory: true)
-        if !fm.fileExists(atPath: cacheDir.path) {
-            try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-        }
-
-        // Extract base name (e.g., "TextEncoder2").
-        let baseName = modelURL.deletingPathExtension().lastPathComponent
-
-        // Compute a hash so updated bundled models force a fresh compile.
-        let hash: String
-        if modelURL.pathExtension == "mlpackage" {
-            hash = self.cacheDirectoryKey(for: modelURL)
-        } else {
-            hash = self.cacheKey(for: modelURL)
-        }
-
-        // Cache filename <BaseName>_<hash>.mlmodelc.
-        let cacheName = "\(baseName)_\(hash).mlmodelc"
-        let cachedModelURL = cacheDir.appendingPathComponent(cacheName)
-
-        // Cleanup: remove any old cached versions for this base model.
-        let cacheContents = try fm.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)
-        for url in cacheContents {
-            if url.lastPathComponent.hasPrefix(baseName + "_") &&
-                url.lastPathComponent != cacheName {
-                try? fm.removeItem(at: url)
-            }
-        }
-
-        // If cache missing → compile or copy.
-        if !fm.fileExists(atPath: cachedModelURL.path) {
-
-            if modelURL.pathExtension == "mlpackage" {
-                // Compile .mlpackage → .mlmodelc.
-                let compiled = try MLModel.compileModel(at: modelURL)
-                try fm.copyItem(at: compiled, to: cachedModelURL)
-
-            } else if modelURL.pathExtension == "mlmodel" {
-                // Raw → compile then cache.
-                let compiled = try MLModel.compileModel(at: modelURL)
-                try fm.copyItem(at: compiled, to: cachedModelURL)
-
-            } else {
-                throw NSError(
-                    domain: "ModelLoader",
-                    code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Unsupported model type: \(modelURL)"]
-                )
-            }
-        }
-
-        // Load the cached compiled model.
-        loadedModel = try MLModel(contentsOf: cachedModelURL, configuration: configuration)
     }
 }
 

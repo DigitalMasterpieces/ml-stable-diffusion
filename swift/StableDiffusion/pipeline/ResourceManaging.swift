@@ -4,7 +4,7 @@
 import Foundation
 
 /// Protocol for managing internal resources
-public protocol ResourceManaging {
+public protocol ResourceManaging: Sendable {
 
     /// Request resources to be loaded and ready if possible
     func loadResources(progress: Progress, prewarm: Bool) throws

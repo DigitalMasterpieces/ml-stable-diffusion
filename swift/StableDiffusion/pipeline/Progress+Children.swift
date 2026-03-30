@@ -5,8 +5,8 @@ import Foundation
 
 extension Progress {
 
-    private static var rootKey: UInt8 = 0
-    private static var progressChildrenKey: UInt8 = 1
+    nonisolated(unsafe) private static var rootKey: UInt8 = 0
+    nonisolated(unsafe) private static var progressChildrenKey: UInt8 = 1
 
     /// Reference to the root progress (UI-facing)
     var rootProgress: Progress? {

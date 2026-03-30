@@ -5,6 +5,7 @@
 import Foundation
 import CoreML
 import Accelerate
+import os
 
 @available(iOS 16.2, macOS 13.1, *)
 public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
@@ -104,6 +105,9 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
             return []
         }
 
+        let executeState = signposter.beginInterval("ControlNet Execute")
+        defer { signposter.endInterval("ControlNet Execute", executeState) }
+
         // Match time step batch dimension to the model / latent samples
         // Infer batch size from hiddenStates shape (batch size 2 for CFG, 1 for no CFG)
         let batchSize = hiddenStates.shape[0]
@@ -138,10 +142,12 @@ public struct ControlNetXL: ResourceManaging, ControlNetXLProtocol {
             
             let batch = MLArrayBatchProvider(array: inputs)
 
-            let results = try model.perform {
-                try $0.predictions(fromBatch: batch)
+            let results = try signposter.withIntervalSignpost("ControlNet Predict", "Model \(modelIndex, privacy: .public)") {
+                try model.perform {
+                    try $0.predictions(fromBatch: batch)
+                }
             }
-            
+
             for n in 0..<results.count {
                 let result = results.features(at: n)
                 for k in result.featureNames {
