@@ -19,14 +19,11 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.7.0"),
-        .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.2.0"),
     ],
     targets: [
         .target(
             name: "StableDiffusion",
-            dependencies:  [
-                .product(name: "Transformers", package: "swift-transformers"),
-            ],
+            dependencies: [],
             path: "swift/StableDiffusion",
             swiftSettings: [.swiftLanguageMode(.v6)]),
         .executableTarget(

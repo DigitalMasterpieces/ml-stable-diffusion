@@ -2,8 +2,6 @@
 // Copyright (C) 2024 Apple Inc. All Rights Reserved.
 
 import Foundation
-import Hub
-import Tokenizers
 
 /// Extension to swift-transformers Hub.swift to load local Config files
 public extension Config {

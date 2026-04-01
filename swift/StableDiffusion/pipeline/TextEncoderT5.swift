@@ -4,7 +4,6 @@
 import Foundation
 import CoreML
 import os
-import Tokenizers
 
 @available(iOS 17.0, macOS 14.0, *)
 public protocol TextEncoderT5Model: ResourceManaging {
