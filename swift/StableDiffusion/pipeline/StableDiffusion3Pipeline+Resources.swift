@@ -4,8 +4,6 @@
 
 import CoreML
 import Foundation
-import Tokenizers
-import Hub
 
 @available(iOS 17.0, macOS 14.0, *)
 public extension StableDiffusion3Pipeline {
