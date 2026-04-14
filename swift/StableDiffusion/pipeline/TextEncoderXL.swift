@@ -8,6 +8,10 @@ import os
 @available(iOS 17.0, macOS 14.0, *)
 public protocol TextEncoderXLModel: ResourceManaging {
     typealias TextEncoderXLOutput = (hiddenEmbeddings: MLShapedArray<Float32>, pooledOutputs: MLShapedArray<Float32>)
+
+    /// The model's expected input sequence length (total tokens including start/end/pad).
+    var inputLength: Int { get }
+
     func encode(_ text: String) throws -> TextEncoderXLOutput
 }
 
@@ -20,6 +24,12 @@ public struct TextEncoderXL: TextEncoderXLModel {
 
     /// Embedding model
     var model: ManagedMLModel
+
+    /// Fixed input sequence length for CLIP-based text encoders (ViT-L/14 and OpenCLIP ViT-G/14).
+    ///
+    /// This is the total token count including the start-of-text and end-of-text markers plus
+    /// padding. The effective content-token budget is `inputLength - 2`.
+    public let inputLength: Int = 77
 
     /// Creates text encoder which embeds a tokenized string
     ///
