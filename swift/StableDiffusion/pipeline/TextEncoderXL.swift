@@ -20,7 +20,7 @@ public protocol TextEncoderXLModel: ResourceManaging {
 public struct TextEncoderXL: TextEncoderXLModel {
 
     /// Text tokenizer
-    var tokenizer: BPETokenizer
+    public var tokenizer: BPETokenizer
 
     /// Embedding model
     var model: ManagedMLModel

@@ -97,6 +97,13 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         self.textEncoder2.inputLength
     }
 
+    /// The tokenizer used by the primary text encoder for prompt tokenization.
+    ///
+    /// Returns `nil` when the concrete text encoder type is not `TextEncoderXL`.
+    public var promptTokenizer: BPETokenizer? {
+        (self.textEncoder2 as? TextEncoderXL)?.tokenizer
+    }
+
     public var loadProgressWeights: [Int64] {
         var totalUnits: Int64 = 0
 
