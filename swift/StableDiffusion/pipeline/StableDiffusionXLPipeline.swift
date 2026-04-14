@@ -92,6 +92,14 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         self.reduceMemory = reduceMemory
     }
 
+    /// The text encoder's expected input sequence length (total tokens including start/end/pad).
+    ///
+    /// Returns `nil` when the concrete text encoder type doesn't expose an input shape.
+    /// Must be called after `loadResources()` so the underlying `MLModel` is available.
+    public var textInputLength: Int? {
+        (self.textEncoder2 as? TextEncoderXL)?.inputShape.last
+    }
+
     public var loadProgressWeights: [Int64] {
         var totalUnits: Int64 = 0
 
