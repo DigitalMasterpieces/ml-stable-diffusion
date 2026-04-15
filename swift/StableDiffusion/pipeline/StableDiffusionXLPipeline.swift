@@ -92,9 +92,9 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         self.reduceMemory = reduceMemory
     }
 
-    /// The text encoder's expected input sequence length (total tokens including start/end/pad).
-    public var textInputLength: Int {
-        self.textEncoder2.inputLength
+    /// Maximum user-visible content tokens the primary text encoder accepts for a prompt.
+    public var maxContentTokens: Int {
+        self.textEncoder2.maxContentTokens
     }
 
     /// The tokenizer used by the primary text encoder for prompt tokenization.

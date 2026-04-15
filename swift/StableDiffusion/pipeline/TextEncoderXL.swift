@@ -12,6 +12,10 @@ public protocol TextEncoderXLModel: ResourceManaging {
     /// The model's expected input sequence length (total tokens including start/end/pad).
     var inputLength: Int { get }
 
+    /// Maximum number of user-visible content tokens that fit in the model input, excluding
+    /// the framing tokens the tokenizer adds internally.
+    var maxContentTokens: Int { get }
+
     func encode(_ text: String) throws -> TextEncoderXLOutput
 }
 
@@ -28,8 +32,13 @@ public struct TextEncoderXL: TextEncoderXLModel {
     /// Fixed input sequence length for CLIP-based text encoders (ViT-L/14 and OpenCLIP ViT-G/14).
     ///
     /// This is the total token count including the start-of-text and end-of-text markers plus
-    /// padding. The effective content-token budget is `inputLength - 2`.
+    /// padding. Consumers that want the user-visible budget should read `maxContentTokens`.
     public let inputLength: Int = 77
+
+    /// Maximum user-visible content tokens that fit in the model input.
+    public var maxContentTokens: Int {
+        BPETokenizer.contentTokenCapacity(inputLength: self.inputLength)
+    }
 
     /// Creates text encoder which embeds a tokenized string
     ///

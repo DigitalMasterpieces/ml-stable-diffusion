@@ -72,6 +72,28 @@ public struct BPETokenizer: Sendable {
         return (tokens: tokens, tokenIDs: ids)
     }
 
+    /// Number of framing tokens (start-of-text + end-of-text) added by `tokenize` and
+    /// `tokenizeWithWeights` to every input.
+    private static let framingTokenCount: Int = 2
+
+    /// Number of content tokens produced for `text`, excluding the framing start-of-text and
+    /// end-of-text markers that the tokenizer adds internally.
+    ///
+    /// Matches the `tokenizeWithWeights` code path used by the text encoder at inference time,
+    /// so it reflects what will actually be fed into the model (including A1111-style prompt
+    /// weighting syntax).
+    public func contentTokenCount(for text: String) -> Int {
+        max(0, self.tokenizeWithWeights(text).tokens.count - Self.framingTokenCount)
+    }
+
+    /// Content-token capacity for a given total model input length.
+    ///
+    /// Subtracts the fixed framing overhead from the raw model input length to expose the
+    /// number of user-visible tokens that will fit without truncation.
+    public static func contentTokenCapacity(inputLength: Int) -> Int {
+        max(0, inputLength - Self.framingTokenCount)
+    }
+
     /// Returns the token identifier for a token.
     public func tokenID(for token: String) -> Int? {
         vocabulary[token]
