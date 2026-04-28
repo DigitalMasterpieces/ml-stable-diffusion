@@ -2506,11 +2506,28 @@ def _get_controlnet_union_chunk_sample_inputs(
     # -------------------------------------------------------------------------
     if chunk_name == "ControlNetAlphaTimeEmbed":
         # control_type: [batch_size, num_control_type]
-        control_mode = list(range(num_control_type))
-        control_type = torch.zeros(num_control_type).scatter_(0, torch.tensor(control_mode), 1)
-        control_type = control_type.reshape(1, -1).to(torch.int32).repeat(batch_size, 1)
+        # Use torch.ones directly instead of zeros+scatter. The graph is more robust
+        # when traced with "all types active" seeding — starting from a zeros tensor
+        # can trigger constant folding / optimization that silently drops operations
+        # at the CoreML conversion layer, which may then misbehave at inference when
+        # real zeros come in through conditioning_scale.
+        control_type = torch.ones(num_control_type, dtype=torch.int32).reshape(1, -1).repeat(batch_size, 1)
+
+        # SDXL aug_emb inputs — REQUIRED for SDXL ControlNets to produce correct
+        # time embeddings. Without these the time embedding lacks SDXL's text+time
+        # conditioning, causing all downstream chunks to compute wrong residuals.
+        #
+        # text_embeds: [batch_size, pooled_dim=1280] — pooled text embedding from
+        # SDXL's second text encoder.
+        # time_ids:    [batch_size, 6] — micro-conditioning (orig_size, crop_coords,
+        # target_size). Each row is e.g. [orig_h, orig_w, crop_y, crop_x, target_h, target_w].
+        text_embeds = torch.rand(batch_size, 1280)
+        time_ids = torch.rand(batch_size, 6)
+
         inputs = OrderedDict([
             ("timestep", torch.tensor([1000.0] * batch_size).float()),
+            ("text_embeds", text_embeds),
+            ("time_ids", time_ids),
             ("control_type", control_type),
         ])
         return inputs
@@ -2526,7 +2543,9 @@ def _get_controlnet_union_chunk_sample_inputs(
         for i in range(num_control_type):
             inputs[f"controlnet_cond_{i}"] = torch.rand(*controlnet_cond_shape)
         # conditioning_scale: [num_control_type]
-        inputs["conditioning_scale"] = torch.ones(num_control_type)
+        # Use DISTINCT, non-trivial values (not all 1.0) to prevent CoreML's graph
+        # optimizer from constant-folding `feat_seq * scale` into identity.
+        inputs["conditioning_scale"] = torch.linspace(0.1, 0.9, num_control_type)
         return inputs
 
     # -------------------------------------------------------------------------

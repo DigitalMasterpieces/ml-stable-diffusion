@@ -448,7 +448,7 @@ class ControlNetUnionModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             output_scale_factor=mid_block_scale_factor,
             resnet_time_scale_shift=resnet_time_scale_shift,
             cross_attention_dim=cross_attention_dim,
-            num_attention_heads=num_attention_heads[-1],
+            attn_num_head_channels=num_attention_heads[-1],
             resnet_groups=norm_num_groups,
             use_linear_projection=use_linear_projection,
             upcast_attention=upcast_attention,
@@ -472,6 +472,7 @@ class ControlNetUnionModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         control_type: torch.Tensor,
         conditioning_scale: Union[float, List[float]] = 1.0,
         class_labels: Optional[torch.Tensor] = None,
+        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
         guess_mode: bool = False,
     ):
         """
@@ -569,6 +570,41 @@ class ControlNetUnionModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
             class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
             emb = emb + class_emb
+
+        # SDXL-specific: compute aug_emb from text_embeds + time_ids and add to time embedding.
+        # This is REQUIRED for SDXL ControlNets — without it, every down-block ResNet receives
+        # the wrong temb, breaking the residuals downstream. Matches diffusers'
+        # ControlNetUnionModel.forward exactly (see diffusers/models/controlnets/controlnet_union.py).
+        if self.config.addition_embed_type is not None:
+            if self.config.addition_embed_type == "text":
+                if added_cond_kwargs is None or "encoder_hidden_states" not in added_cond_kwargs:
+                    aug_emb = self.add_embedding(encoder_hidden_states)
+                else:
+                    aug_emb = self.add_embedding(added_cond_kwargs["encoder_hidden_states"])
+            elif self.config.addition_embed_type == "text_time":
+                if added_cond_kwargs is None:
+                    raise ValueError(
+                        f"{self.__class__} has the config param `addition_embed_type` set to "
+                        f"'text_time' which requires the `added_cond_kwargs` argument with "
+                        f"`text_embeds` and `time_ids` keys."
+                    )
+                if "text_embeds" not in added_cond_kwargs:
+                    raise ValueError(
+                        f"`added_cond_kwargs` is missing required key 'text_embeds' for "
+                        f"addition_embed_type='text_time'."
+                    )
+                if "time_ids" not in added_cond_kwargs:
+                    raise ValueError(
+                        f"`added_cond_kwargs` is missing required key 'time_ids' for "
+                        f"addition_embed_type='text_time'."
+                    )
+                text_embeds = added_cond_kwargs["text_embeds"]
+                time_ids = added_cond_kwargs["time_ids"]
+                time_embeds = self.add_time_proj(time_ids.flatten())
+                time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+                add_embeds = torch.cat([text_embeds, time_embeds], dim=-1)
+                add_embeds = add_embeds.to(emb.dtype)
+                aug_emb = self.add_embedding(add_embeds)
 
         control_embeds = self.control_type_proj(control_type.flatten())
         control_embeds = control_embeds.reshape((t_emb.shape[0], -1))

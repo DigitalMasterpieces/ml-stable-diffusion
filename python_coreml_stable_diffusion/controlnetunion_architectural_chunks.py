@@ -31,7 +31,7 @@ from typing import List, Union, Optional
 
 class ControlNetAlphaTimeEmbedChunk(nn.Module):
     """
-    Chunk 0: AlphaTimeEmbed - Time and control type embedding computation
+    Chunk 0: AlphaTimeEmbed - Time, SDXL aug, and control type embedding computation
 
     This chunk is isolated to allow running on CPU/GPU if Neural Engine
     has issues with sin/cos operators (e.g., on M1 iPad Pro).
@@ -39,15 +39,20 @@ class ControlNetAlphaTimeEmbedChunk(nn.Module):
     Contains:
         - time_proj: Timestep projection (sin/cos)
         - time_embedding: Timestep MLP
+        - add_time_proj: SDXL micro-conditioning projection (sin/cos) — for text_time
+        - add_embedding: SDXL aug embedding MLP — for text_time
         - control_type_proj: Control type projection (sin/cos)
         - control_add_embedding: Control type MLP
 
     Inputs:
         - timestep: [B] timestep values
+        - text_embeds: [B, pooled_dim] SDXL pooled text embedding
+        - time_ids: [B, 6] SDXL micro-conditioning (orig_size + crop_coords + target_size)
         - control_type: [B, num_control_type] control type flags
 
     Outputs:
-        - emb: [B, 1280, 1, 1] time embedding (4D for Conv2d compatibility)
+        - emb: [B, 1280, 1, 1] time embedding (4D for Conv2d compatibility),
+               INCLUDING aug_emb (text+time conditioning) which is required by SDXL.
     """
 
     def __init__(self, controlnet):
@@ -56,6 +61,12 @@ class ControlNetAlphaTimeEmbedChunk(nn.Module):
         self.time_proj = controlnet.time_proj
         self.time_embedding = controlnet.time_embedding
 
+        # SDXL aug embedding — REQUIRED for SDXL ControlNets. Without including this,
+        # the time embedding fed to all downstream chunks lacks the SDXL text+time
+        # conditioning, producing incorrect residuals.
+        self.add_time_proj = controlnet.add_time_proj
+        self.add_embedding = controlnet.add_embedding
+
         # Control type embedding
         self.control_type_proj = controlnet.control_type_proj
         self.control_add_embedding = controlnet.control_add_embedding
@@ -63,6 +74,8 @@ class ControlNetAlphaTimeEmbedChunk(nn.Module):
     def forward(
         self,
         timestep: torch.Tensor,
+        text_embeds: torch.Tensor,
+        time_ids: torch.Tensor,
         control_type: torch.Tensor,
     ):
         # 1. Time embedding
@@ -70,12 +83,21 @@ class ControlNetAlphaTimeEmbedChunk(nn.Module):
         t_emb = t_emb.to(dtype=torch.float32)
         emb = self.time_embedding(t_emb)
 
-        # 2. Control type embedding
+        # 2. SDXL aug embedding — text + time conditioning
+        time_embeds = self.add_time_proj(time_ids.flatten())
+        time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+        add_embeds = torch.cat([text_embeds, time_embeds], dim=-1)
+        add_embeds = add_embeds.to(emb.dtype)
+        aug_emb = self.add_embedding(add_embeds)
+
+        # 3. Control type embedding
         control_embeds = self.control_type_proj(control_type.flatten())
         control_embeds = control_embeds.reshape((timestep.shape[0], -1))
         control_embeds = control_embeds.to(emb.dtype)
         control_emb = self.control_add_embedding(control_embeds)
-        emb = emb + control_emb
+
+        # Final emb: time + aug + control
+        emb = emb + control_emb + aug_emb
 
         return (emb,)
 
