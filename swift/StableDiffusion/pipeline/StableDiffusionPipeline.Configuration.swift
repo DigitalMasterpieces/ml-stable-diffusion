@@ -9,7 +9,7 @@ import CoreGraphics
 public enum PipelineMode {
     case textToImage
     case imageToImage
-    // case inPainting
+    case inPainting
 }
 
 /// Image generation configuration
@@ -21,6 +21,10 @@ public struct PipelineConfiguration: Hashable {
     public var negativePrompt: String = ""
     /// Starting image for image2image or in-painting
     public var startingImage: CGImage? = nil
+    /// Mask image for in-painting. White (1.0) regions are regenerated, black (0.0) regions are preserved.
+    /// Setting this (together with `startingImage`) is what flips the pipeline into
+    /// `.inPainting` mode — there is no separate flag.
+    public var maskImage: CGImage? = nil
     ///
     public var imageInput: CGImage? = nil
     /// Fraction of inference steps to be used in `.imageToImage` pipeline mode
@@ -90,6 +94,9 @@ public struct PipelineConfiguration: Hashable {
     public var mode: PipelineMode {
         guard startingImage != nil else {
             return .textToImage
+        }
+        if maskImage != nil {
+            return .inPainting
         }
         guard strength < 1.0 else {
             return .textToImage
