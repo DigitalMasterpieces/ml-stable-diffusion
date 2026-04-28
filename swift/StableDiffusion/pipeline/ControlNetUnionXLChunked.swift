@@ -238,10 +238,12 @@ public struct ControlNetUnionXLChunked: ResourceManaging, ControlNetXLProtocol {
 
         for (latentIndex, latent) in latents.enumerated() {
             // --- Stage 0: AlphaTimeEmbed ---
-            // Inputs: timestep, control_type
+            // Inputs: timestep, text_embeds, time_ids, control_type
             // Outputs: emb [B, 1280, 1, 1]
             let alphaInputs: [String: Any] = [
                 "timestep": MLMultiArray(t),
+                "text_embeds": MLMultiArray(pooledStates),
+                "time_ids": MLMultiArray(geometryConditioning),
                 "control_type": MLMultiArray(controlType),
             ]
 

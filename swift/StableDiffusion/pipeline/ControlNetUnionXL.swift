@@ -152,10 +152,12 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
                     )
 
                 let inputs = try latents.map { latent in
-                    var dict: [String: MLMultiArray] = [
+                    let dict: [String: MLMultiArray] = [
                         "sample": MLMultiArray(latent),
                         "timestep": MLMultiArray(t),
                         "encoder_hidden_states": MLMultiArray(hiddenStates),
+                        "text_embeds": MLMultiArray(pooledStates),
+                        "time_ids": MLMultiArray(geometryConditioning),
                         "control_type": MLMultiArray(controlTypeIDMaskArray),
                         "controlnet_cond_\(controlID)": MLMultiArray(controlImage),
                         "conditioning_scale": MLMultiArray(conditioningScalesArray)
