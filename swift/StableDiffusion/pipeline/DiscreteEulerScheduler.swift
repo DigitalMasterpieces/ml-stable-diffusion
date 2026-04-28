@@ -90,10 +90,13 @@ public class DiscreteEulerScheduler: Scheduler {
         var sigmas: [Double] = alphasCumProd.map { Double(pow((1 - $0) / $0, 0.5)) }
         sigmas = vDSP.linearInterpolate(elementsOf: sigmas, using: timeSteps) + [0]
 
+        // Matches diffusers EulerDiscreteScheduler:
+        //   init_noise_sigma = max(sigmas)                      if linspace or trailing
+        //   init_noise_sigma = (max(sigmas)**2 + 1) ** 0.5      if leading (or karras)
         switch timestepSpacing {
-            case .linspace, .leading, .karras:
+            case .linspace, .trailing:
                 self.initNoiseSigma = Float(sigmas.max() ?? 1)
-            case .trailing:
+            case .leading, .karras:
                 self.initNoiseSigma = pow(pow(Float(sigmas.max() ?? 1), 2) + 1, 0.5)
         }
 

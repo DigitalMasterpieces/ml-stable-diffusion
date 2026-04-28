@@ -49,6 +49,12 @@ public final class DPMSolverMultistepScheduler: Scheduler {
     // Stores solverOrder (2) items
     public private(set) var modelOutputs: [MLShapedArray<Float32>] = []
 
+    /// Standard deviation of the initial noise distribution.
+    /// Must match HuggingFace diffusers: `sigmas.max()` for DPM-Solver++.
+    /// Without this override the protocol default of 1.0 produces severely
+    /// desaturated / washed-out images because the initial noise is ~14× too weak.
+    public let initNoiseSigma: Float
+
     /// Create a scheduler that uses a second order DPM-Solver++ algorithm.
     ///
     /// - Parameters:
@@ -124,6 +130,15 @@ public final class DPMSolverMultistepScheduler: Scheduler {
         }
 
         self.lambda_t = zip(self.alpha_t, self.sigma_t).map { α, σ in log(α) - log(σ) }
+
+        // Match diffusers: init_noise_sigma = sigmas.max() for dpmsolver++
+        // where sigmas = sqrt((1 - alphas_cumprod) / alphas_cumprod).
+        // Computed as sigma_t / alpha_t regardless of Karras mode.
+        let rawSigmas = zip(self.sigma_t, self.alpha_t).map { s, a -> Float in
+            guard a > 0 else { return 0 }
+            return s / a
+        }
+        self.initNoiseSigma = rawSigmas.max() ?? 1.0
     }
     
     func timestepToIndex(_ timestep: Double) -> Int {
