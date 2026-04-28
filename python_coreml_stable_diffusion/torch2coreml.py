@@ -2331,22 +2331,38 @@ def convert_controlnet(pipe, args):
             # Setup inputs
             if is_union:
                 num_control_type = reference_controlnet.config.num_control_type
+
+                # SDXL aug_emb inputs (text_embeds, time_ids) — REQUIRED for SDXL
+                # ControlNet Union to produce correct time embeddings. Without these
+                # the time embedding lacks SDXL's text+time conditioning, breaking
+                # all downstream residuals. The `make_controlnet` wrapper takes them
+                # positionally between `encoder_hidden_states` and `controlnet_cond_*`,
+                # so they must be inserted in the OrderedDict in the same order.
+                #
+                # text_embeds: [batch_size, pooled_dim=1280] — pooled text embedding
+                # from SDXL's second text encoder.
+                # time_ids:    [batch_size, 6] — micro-conditioning (orig_size,
+                # crop_coords, target_size).
+                sample_controlnet_inputs['text_embeds'] = torch.rand(batch_size, 1280)
+                sample_controlnet_inputs['time_ids'] = torch.rand(batch_size, 6)
+
                 for i in range(num_control_type):
                     sample_controlnet_inputs['controlnet_cond_' + str(i)] = torch.rand(*controlnet_cond_shape)
-                control_mode = list(range(num_control_type))
-                control_type = torch.zeros(num_control_type).scatter_(0, torch.tensor(control_mode), 1)
-                control_type_repeat_factor = (
-                    batch_size
-                )
-                control_type = (
-                    control_type.reshape(1, -1)
-                    .to(torch.int32)
-                    .repeat(control_type_repeat_factor, 1)
-                )
+
+                # Tracing safeguards (mirroring the chunked path):
+                # - Seed `control_type` with ones rather than zeros+scatter. Starting
+                #   from a zeros tensor can trigger constant folding at the CoreML
+                #   conversion layer that silently drops ops, which then misbehave
+                #   at inference when real zeros come in via conditioning_scale.
+                # - Seed `conditioning_scale` with non-trivial distinct values
+                #   (`linspace(0.1, 0.9, N)`) rather than all-ones. All-ones lets
+                #   the CoreML graph optimizer constant-fold `feat_seq * scale` into
+                #   identity, dropping the multiplication at runtime.
+                control_type = torch.ones(num_control_type, dtype=torch.int32) \
+                    .reshape(1, -1).repeat(batch_size, 1)
                 sample_controlnet_inputs['control_type'] = control_type
-                conditioning_scale = torch.ones(
-                    (num_control_type,)
-                )
+
+                conditioning_scale = torch.linspace(0.1, 0.9, num_control_type)
                 sample_controlnet_inputs['conditioning_scale'] = conditioning_scale
             else:
                 num_control_type = 1
@@ -2434,6 +2450,14 @@ def convert_controlnet(pipe, args):
             "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. " \
             "Shorter text does not reduce computation."
         if is_union:
+            coreml_controlnet.input_description["text_embeds"] = \
+                "SDXL pooled text embedding (output of the second text encoder). " \
+                "Used together with `time_ids` to compute the SDXL aug_emb that is " \
+                "added to the time embedding."
+            coreml_controlnet.input_description["time_ids"] = \
+                "SDXL micro-conditioning vector of shape [B, 6]: " \
+                "(orig_h, orig_w, crop_top, crop_left, target_h, target_w). " \
+                "Used together with `text_embeds` to compute the SDXL aug_emb."
             for i in range(num_control_type):
                 coreml_controlnet.input_description["controlnet_cond_" + str(i)] = \
                 "An additional input image for ControlNet to condition the generated images."

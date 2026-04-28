@@ -266,11 +266,19 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         // Store denoised latents from scheduler to pass into decoder
         var denoisedLatents: [MLShapedArray<Float32>] = latents.map { MLShapedArray(converting: $0) }
 
+        // InPainting setup. `inpaintContext` is non-nil iff `config.mode == .inPainting`
+        // *and* all the prerequisites (startingImage, maskImage, encoder) are present.
+        // Everything inpaint-specific lives in `StableDiffusionXLPipeline+InPainting.swift`
+        // so the denoising loop below stays focused on the generic flow.
+        let inpaintContext = try makeInPaintingContext(config: config, encoder: encoder)
+
         if reduceMemory {
             encoder?.unloadResources()
         }
 
-        let timestepStrength: Float? = config.mode == .imageToImage ? config.strength : nil
+        // Strength truncates the denoising schedule for both img2img and inpaint
+        // (matching the xinsir StableDiffusionXLControlNetUnionInpaintPipeline reference).
+        let timestepStrength: Float? = (config.mode == .imageToImage || config.mode == .inPainting) ? config.strength : nil
 
         // Convert cgImage for ControlNet into MLShapedArray
         let controlNetConds: [[MLShapedArray<Float32>?]] = try config.controlNetInputs.map { modelImages in
@@ -409,7 +417,25 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                     sample: latents[i]
                 )
 
-                denoisedLatents[i] = scheduler[i].modelOutputs.last ?? latents[i]
+                // For the preview / final decode we want CLEAN latents, not the noisy
+                // post-step sample (whose magnitude ~ sigma * N(0,1) in early steps would
+                // decode to rainbow noise). Use the scheduler's `pred_x0` instead.
+                let predictedX0 = scheduler[i].modelOutputs.last
+
+                // InPainting: replace unmasked regions in both `latents` (re-noised
+                // original, fed back into the next step) and the preview (clean original,
+                // shown to the user). All math lives in `InPaintingContext` to keep this
+                // loop readable for the non-inpainting case.
+                if let inpaintContext {
+                    latents[i] = inpaintContext.blendStepLatents(
+                        latents[i], scheduler: scheduler[i],
+                        timeSteps: timeSteps, stepIndex: step
+                    )
+                    denoisedLatents[i] = inpaintContext.blendPreview(predictedX0: predictedX0)
+                        ?? latents[i]
+                } else {
+                    denoisedLatents[i] = predictedX0 ?? latents[i]
+                }
             }
             signposter.endInterval("Scheduler Step", schedulerStepState)
 
@@ -584,15 +610,14 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         var random = randomSource(from: config.rngType, seed: config.seed)
 
-        if let image = config.startingImage, config.mode == .imageToImage, config.strength < 1.0 {
+        // Seed initial latents from the noised original image for img2img and inpaint<1.0,
+        // matching the xinsir reference pipeline (prepare_latents → add_noise(image_latent, noise, latent_timestep)).
+        let seedFromImage = config.startingImage != nil &&
+            (config.mode == .imageToImage || config.mode == .inPainting) &&
+            config.strength < 1.0
+        if seedFromImage, let image = config.startingImage {
             guard let encoder else {
                 throw PipelineError.startingImageProvidedWithoutEncoder
-            }
-
-            let stdev = 1.0
-            let samples = (0..<config.imageCount).map { _ in
-                MLShapedArray<Float32>(
-                    converting: random.normalShapedArray(sampleShape, mean: 0.0, stdev: Double(stdev)))
             }
 
             // Use tiled encoding if configured (enables Neural Engine on memory-constrained devices)
@@ -606,6 +631,13 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 )
             } else {
                 latent = try encoder.encode(image, scaleFactor: config.encoderScaleFactor, random: &random)
+            }
+
+            // img2img / inpaint: add noise based on strength
+            let stdev = 1.0
+            let samples = (0..<config.imageCount).map { _ in
+                MLShapedArray<Float32>(
+                    converting: random.normalShapedArray(sampleShape, mean: 0.0, stdev: Double(stdev)))
             }
             if let scheduler = scheduler as? DiscreteEulerScheduler {
                 return scheduler.addNoise(originalSample: latent, noise: samples, timeStep: nil)

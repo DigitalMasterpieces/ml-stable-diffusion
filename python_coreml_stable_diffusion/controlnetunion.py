@@ -112,12 +112,21 @@ def make_controlnet(num_control_types: int, **kwargs):
     cond_list = ", ".join([f"controlnet_cond_{i}"
                            for i in range(num_control_types)])
 
+    # SDXL aug_emb inputs (text_embeds, time_ids) are required for ControlNet Union
+    # models with `addition_embed_type == "text_time"`; without them every down-block
+    # ResNet receives the wrong temb and downstream residuals are incorrect. They are
+    # passed through as positional args so `torch.jit.trace` (which calls the model
+    # with `list(sample_controlnet_inputs.values())`) sees them, and forwarded to
+    # `ControlNetUnionModel.forward` via `added_cond_kwargs`. For ControlNets where
+    # `addition_embed_type` is `None`, the kwargs are simply ignored inside the model.
     src = f"""
 def forward(
     self,
     sample: torch.Tensor,
     timestep: Union[torch.Tensor, float, int],
     encoder_hidden_states: torch.Tensor,
+    text_embeds: torch.Tensor,
+    time_ids: torch.Tensor,
     {cond_args},
     control_type: torch.Tensor,
     conditioning_scale: Union[float, List[float]] = 1.0,
@@ -134,6 +143,7 @@ def forward(
         control_type,
         conditioning_scale=conditioning_scale,
         class_labels=class_labels,
+        added_cond_kwargs={{"text_embeds": text_embeds, "time_ids": time_ids}},
         guess_mode=guess_mode,
     )
 """
