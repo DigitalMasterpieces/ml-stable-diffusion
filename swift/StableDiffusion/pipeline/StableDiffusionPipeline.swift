@@ -37,6 +37,7 @@ public enum PipelineError: String, Swift.Error {
     case startingText2ImgWithoutTextEncoder
     case unsupportedOSVersion
     case errorCreatingPreview
+    case errorMaskBinarization
 }
 
 @available(iOS 16.2, macOS 13.1, *)
