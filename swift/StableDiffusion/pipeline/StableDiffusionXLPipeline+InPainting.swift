@@ -96,45 +96,39 @@ extension StableDiffusionXLPipeline {
         return InPaintingContext(imageLatent: imageLatent, noise: noise, maskLatent: maskLatent)
     }
 
-    /// Renders `maskCGImage` directly at latent resolution into a 1-channel grayscale
-    /// buffer (CoreGraphics handles the downsampling via Accelerate under the hood),
-    /// then thresholds at 0.5 with vDSP to produce a binary `[1, 1, H, W]` latent mask.
+    /// Downsamples `maskCGImage` to a 1-channel grayscale buffer at latent resolution
+    /// (via `CGImage.withGrayscaleResampledPixels`), then thresholds at 0.5 with vDSP
+    /// to produce a binary `[1, 1, H, W]` latent mask.
     private static func makeBinaryLatentMask(
         from maskCGImage: CGImage,
         latentH: Int,
         latentW: Int
     ) throws -> MLShapedArray<Float32> {
-        let colorSpace = CGColorSpaceCreateDeviceGray()
-        guard let maskCtx = CGContext(
-            data: nil, width: latentW, height: latentH,
-            bitsPerComponent: 8, bytesPerRow: latentW,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.none.rawValue
-        ) else {
-            throw PipelineError.resourceLoadError
-        }
-        maskCtx.interpolationQuality = .high
-        maskCtx.draw(maskCGImage, in: CGRect(x: 0, y: 0, width: latentW, height: latentH))
-        guard let maskData = maskCtx.data else { throw PipelineError.resourceLoadError }
-        let maskPixels = maskData.bindMemory(to: UInt8.self, capacity: latentH * latentW)
+        let count = latentH * latentW
+        var maskScalars = [Float32](repeating: 0, count: count)
 
         // Vectorized UInt8 -> {0.0, 1.0} via vDSP:
         //   1. convert UInt8 pixels (0..255) to Float32
         //   2. vDSP_vlim maps each value to +0.5 if >= 128, else -0.5
         //   3. vDSP_vsadd shifts by +0.5 to land on {1.0, 0.0}
-        let count = latentH * latentW
-        var maskScalars = [Float32](repeating: 0, count: count)
-        maskScalars.withUnsafeMutableBufferPointer { buf in
-            var bufLocal = buf
-            vDSP.convertElements(of: UnsafeBufferPointer(start: maskPixels, count: count), to: &bufLocal)
-            var threshold: Float = 128.0
-            var half: Float = 0.5
-            vDSP_vlim(buf.baseAddress!, 1, &threshold, &half, buf.baseAddress!, 1, vDSP_Length(count))
-            vDSP_vsadd(buf.baseAddress!, 1, &half, buf.baseAddress!, 1, vDSP_Length(count))
+        do {
+            try maskCGImage.withGrayscaleResampledPixels(width: latentW, height: latentH) { pixels in
+                maskScalars.withUnsafeMutableBufferPointer { buf in
+                    var bufLocal = buf
+                    vDSP.convertElements(of: UnsafeBufferPointer(start: pixels, count: count), to: &bufLocal)
+                    var threshold: Float = 128.0
+                    var half: Float = 0.5
+                    vDSP_vlim(buf.baseAddress!, 1, &threshold, &half, buf.baseAddress!, 1, vDSP_Length(count))
+                    vDSP_vsadd(buf.baseAddress!, 1, &half, buf.baseAddress!, 1, vDSP_Length(count))
+                }
+            }
+        } catch {
+            throw PipelineError.errorMaskBinarization
         }
         return MLShapedArray<Float32>(scalars: maskScalars, shape: [1, 1, latentH, latentW])
     }
 }
+
 
 // MARK: - Per-step blending
 
