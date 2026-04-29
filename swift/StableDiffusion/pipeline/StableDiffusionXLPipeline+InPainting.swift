@@ -1,6 +1,7 @@
 // For licensing see accompanying LICENSE.md file.
 // Copyright (C) 2026 Digital Masterpieces GmbH. All Rights Reserved.
 
+import Accelerate
 import CoreGraphics
 import CoreML
 import Foundation
@@ -95,48 +96,41 @@ extension StableDiffusionXLPipeline {
         return InPaintingContext(imageLatent: imageLatent, noise: noise, maskLatent: maskLatent)
     }
 
-    /// Renders `maskCGImage` into a 1-channel grayscale buffer, area-averages each
-    /// latent cell, and thresholds at 0.5 to produce a binary `[1, 1, H, W]` latent mask.
+    /// Renders `maskCGImage` directly at latent resolution into a 1-channel grayscale
+    /// buffer (CoreGraphics handles the downsampling via Accelerate under the hood),
+    /// then thresholds at 0.5 with vDSP to produce a binary `[1, 1, H, W]` latent mask.
     private static func makeBinaryLatentMask(
         from maskCGImage: CGImage,
         latentH: Int,
         latentW: Int
     ) throws -> MLShapedArray<Float32> {
-        let maskW = maskCGImage.width
-        let maskH = maskCGImage.height
         let colorSpace = CGColorSpaceCreateDeviceGray()
         guard let maskCtx = CGContext(
-            data: nil, width: maskW, height: maskH,
-            bitsPerComponent: 8, bytesPerRow: maskW,
+            data: nil, width: latentW, height: latentH,
+            bitsPerComponent: 8, bytesPerRow: latentW,
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.none.rawValue
         ) else {
             throw PipelineError.resourceLoadError
         }
-        maskCtx.draw(maskCGImage, in: CGRect(x: 0, y: 0, width: maskW, height: maskH))
+        maskCtx.interpolationQuality = .high
+        maskCtx.draw(maskCGImage, in: CGRect(x: 0, y: 0, width: latentW, height: latentH))
         guard let maskData = maskCtx.data else { throw PipelineError.resourceLoadError }
-        let maskPixels = maskData.bindMemory(to: UInt8.self, capacity: maskW * maskH)
+        let maskPixels = maskData.bindMemory(to: UInt8.self, capacity: latentH * latentW)
 
-        var maskScalars = [Float32](repeating: 0, count: latentH * latentW)
-        let blockW = Float(maskW) / Float(latentW)
-        let blockH = Float(maskH) / Float(latentH)
-        for ly in 0..<latentH {
-            for lx in 0..<latentW {
-                let startX = Int(Float(lx) * blockW)
-                let endX = min(Int(Float(lx + 1) * blockW), maskW)
-                let startY = Int(Float(ly) * blockH)
-                let endY = min(Int(Float(ly + 1) * blockH), maskH)
-                var sum: Float = 0
-                var count: Float = 0
-                for py in startY..<endY {
-                    for px in startX..<endX {
-                        sum += Float(maskPixels[py * maskW + px]) / 255.0
-                        count += 1
-                    }
-                }
-                let avg = count > 0 ? sum / count : 0
-                maskScalars[ly * latentW + lx] = avg >= 0.5 ? 1.0 : 0.0
-            }
+        // Vectorized UInt8 -> {0.0, 1.0} via vDSP:
+        //   1. convert UInt8 pixels (0..255) to Float32
+        //   2. vDSP_vlim maps each value to +0.5 if >= 128, else -0.5
+        //   3. vDSP_vsadd shifts by +0.5 to land on {1.0, 0.0}
+        let count = latentH * latentW
+        var maskScalars = [Float32](repeating: 0, count: count)
+        maskScalars.withUnsafeMutableBufferPointer { buf in
+            var bufLocal = buf
+            vDSP.convertElements(of: UnsafeBufferPointer(start: maskPixels, count: count), to: &bufLocal)
+            var threshold: Float = 128.0
+            var half: Float = 0.5
+            vDSP_vlim(buf.baseAddress!, 1, &threshold, &half, buf.baseAddress!, 1, vDSP_Length(count))
+            vDSP_vsadd(buf.baseAddress!, 1, &half, buf.baseAddress!, 1, vDSP_Length(count))
         }
         return MLShapedArray<Float32>(scalars: maskScalars, shape: [1, 1, latentH, latentW])
     }
@@ -196,6 +190,9 @@ extension StableDiffusionXLPipeline.InPaintingContext {
     /// `(1 - mask) * background + mask * denoised`, with `mask` broadcast over the
     /// channel dimension. `denoised` and `background` must share shape `[B, C, H, W]`;
     /// `mask` has shape `[1, 1, H, W]`.
+    ///
+    /// Refactored as `background + mask * (denoised - background)` so each channel
+    /// slice reduces to a `vDSP_vsub` + `vDSP_vma` pair on Accelerate.
     private static func blend(
         denoised: MLShapedArray<Float32>,
         background: MLShapedArray<Float32>,
@@ -203,23 +200,22 @@ extension StableDiffusionXLPipeline.InPaintingContext {
     ) -> MLShapedArray<Float32> {
         let shape = denoised.shape
         let channels = shape[1]
-        let latH = shape[2]
-        let latW = shape[3]
+        let plane = shape[2] * shape[3]
+        let n = vDSP_Length(plane)
         return MLShapedArray<Float32>(unsafeUninitializedShape: shape) { scalars, _ in
             denoised.withUnsafeShapedBufferPointer { den, _, _ in
                 background.withUnsafeShapedBufferPointer { bg, _, _ in
                     mask.withUnsafeShapedBufferPointer { m, _, _ in
+                        let mPtr = m.baseAddress!
+                        let denBase = den.baseAddress!
+                        let bgBase = bg.baseAddress!
+                        let outBase = scalars.baseAddress!
                         for c in 0..<channels {
-                            for y in 0..<latH {
-                                for x in 0..<latW {
-                                    let idx = c * latH * latW + y * latW + x
-                                    let mv = m[y * latW + x]
-                                    scalars.initializeElement(
-                                        at: idx,
-                                        to: (1.0 - mv) * bg[idx] + mv * den[idx]
-                                    )
-                                }
-                            }
+                            let off = c * plane
+                            // tmp = denoised - background  (written into output slice)
+                            vDSP_vsub(bgBase + off, 1, denBase + off, 1, outBase + off, 1, n)
+                            // out = mask * tmp + background
+                            vDSP_vma(outBase + off, 1, mPtr, 1, bgBase + off, 1, outBase + off, 1, n)
                         }
                     }
                 }
