@@ -169,16 +169,9 @@ extension StableDiffusionXLPipeline.InPaintingContext {
 
     /// Preview blend used to drive the intermediate decode shown to the user, and
     /// for the final-step decoded image.
-    ///
-    /// We use the scheduler's `pred_x0` (which is *clean*) on the masked side
-    /// instead of `latents` (which carries `sigma * N(0,1)` noise in early steps
-    /// and would decode to rainbow noise). On the unmasked side we use the
-    /// CLEAN original latent so the preserved pixels are correct from step 0.
-    ///
-    /// Returns `predictedX0` unchanged when there is no `pred_x0` to blend with.
-    func blendPreview(predictedX0: MLShapedArray<Float32>?) -> MLShapedArray<Float32>? {
-        guard let predictedX0 else { return nil }
-        return Self.blend(denoised: predictedX0, background: imageLatent, mask: maskLatent)
+    func blendPreview(denoisedLatents: MLShapedArray<Float32>?) -> MLShapedArray<Float32>? {
+        guard let denoisedLatents else { return nil }
+        return Self.blend(denoised: denoisedLatents, background: imageLatent, mask: maskLatent)
     }
 
     /// `(1 - mask) * background + mask * denoised`, with `mask` broadcast over the

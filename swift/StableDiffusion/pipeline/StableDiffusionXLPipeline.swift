@@ -268,16 +268,14 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         // InPainting setup. `inpaintContext` is non-nil iff `config.mode == .inPainting`
         // *and* all the prerequisites (startingImage, maskImage, encoder) are present.
-        // Everything inpaint-specific lives in `StableDiffusionXLPipeline+InPainting.swift`
-        // so the denoising loop below stays focused on the generic flow.
+        // Everything inpaint-specific lives in `StableDiffusionXLPipeline+InPainting.swift`.
         let inpaintContext = try makeInPaintingContext(config: config, encoder: encoder)
 
         if reduceMemory {
             encoder?.unloadResources()
         }
 
-        // Strength truncates the denoising schedule for both img2img and inpaint
-        // (matching the xinsir StableDiffusionXLControlNetUnionInpaintPipeline reference).
+        // Strength truncates the denoising schedule for both img2img and inpaint.
         let timestepStrength: Float? = (config.mode == .imageToImage || config.mode == .inPainting) ? config.strength : nil
 
         // Convert cgImage for ControlNet into MLShapedArray
@@ -417,11 +415,6 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                     sample: latents[i]
                 )
 
-                // For the preview / final decode we want CLEAN latents, not the noisy
-                // post-step sample (whose magnitude ~ sigma * N(0,1) in early steps would
-                // decode to rainbow noise). Use the scheduler's `pred_x0` instead.
-                let predictedX0 = scheduler[i].modelOutputs.last
-
                 // InPainting: replace unmasked regions in both `latents` (re-noised
                 // original, fed back into the next step) and the preview (clean original,
                 // shown to the user). All math lives in `InPaintingContext` to keep this
@@ -431,10 +424,10 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                         latents[i], scheduler: scheduler[i],
                         timeSteps: timeSteps, stepIndex: step
                     )
-                    denoisedLatents[i] = inpaintContext.blendPreview(predictedX0: predictedX0)
+                    denoisedLatents[i] = inpaintContext.blendPreview(denoisedLatents: scheduler[i].modelOutputs.last)
                         ?? latents[i]
                 } else {
-                    denoisedLatents[i] = predictedX0 ?? latents[i]
+                    denoisedLatents[i] = scheduler[i].modelOutputs.last ?? latents[i]
                 }
             }
             signposter.endInterval("Scheduler Step", schedulerStepState)
@@ -610,8 +603,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         var random = randomSource(from: config.rngType, seed: config.seed)
 
-        // Seed initial latents from the noised original image for img2img and inpaint<1.0,
-        // matching the xinsir reference pipeline (prepare_latents → add_noise(image_latent, noise, latent_timestep)).
+        // Seed initial latents from the noised original image for img2img and inpaint<1.0.
         let seedFromImage = config.startingImage != nil &&
             (config.mode == .imageToImage || config.mode == .inPainting) &&
             config.strength < 1.0
