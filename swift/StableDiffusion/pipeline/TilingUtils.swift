@@ -135,6 +135,50 @@ public struct TilingUtils {
         return image.cropping(to: rect)
     }
 
+    /// Extract a tile region from a CGImage into a fresh, bitmap-backed CGImage.
+    ///
+    /// Unlike `extractImageTile` (which uses `CGImage.cropping(to:)` and shares the source's
+    /// data provider), this routine draws the tile into a new RGBA8 sRGB CGContext. The
+    /// returned image owns its pixel data, which matters when the source comes from
+    /// `CIContext.createCGImage` and downstream consumers read raw bytes via vImage
+    /// (`vImage_Buffer(cgImage:)`): IOSurface-backed shared providers can yield zeros,
+    /// causing silent data corruption that turns ControlNet inputs into a black tile.
+    public static func extractMaterializedTile(
+        from source: CGImage,
+        rect: CGRect
+    ) -> CGImage? {
+        let width = Int(rect.width)
+        let height = Int(rect.height)
+        guard width > 0, height > 0 else { return nil }
+
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: srgb,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+
+        // No context flip needed: in default Quartz user-space (y up from bottom),
+        // `ctx.draw(image, in: r)` lands image row 0 at bitmap row 0 (right-side-up),
+        // because Quartz internally maps the image's Cartesian (y up) origin onto the
+        // bitmap's top-down rows. To pin the source's `rect` (top-down image coords) to
+        // the output's full extent, we draw the entire source at offset (sx, sy) where
+        // sy is chosen so that the source's Cartesian top edge lands at user-space y =
+        // height (= bitmap row 0).
+        let sx = -rect.origin.x
+        let sy = rect.origin.y + rect.height - CGFloat(source.height)
+        ctx.draw(source, in: CGRect(
+            x: sx, y: sy,
+            width: CGFloat(source.width), height: CGFloat(source.height)
+        ))
+
+        return ctx.makeImage()
+    }
+
     // MARK: - Latent Tile Extraction
 
     /// Extract a tile from a latent MLShapedArray
