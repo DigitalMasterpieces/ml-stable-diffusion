@@ -533,13 +533,31 @@ public struct PipelineProgress {
     public var currentImages: [CGImage?] {
         try! pipeline.decodeToImages(currentLatentSamples, configuration: configuration)
     }
+
+    public init(
+        pipeline: StableDiffusionPipelineProtocol,
+        prompt: String,
+        step: Int,
+        stepCount: Int,
+        currentLatentSamples: [MLShapedArray<Float32>],
+        configuration: PipelineConfiguration,
+        phase: Phase
+    ) {
+        self.pipeline = pipeline
+        self.prompt = prompt
+        self.step = step
+        self.stepCount = stepCount
+        self.currentLatentSamples = currentLatentSamples
+        self.configuration = configuration
+        self.phase = phase
+    }
 }
 
 // Helper functions
 
 @available(iOS 16.2, macOS 13.1, *)
 extension StableDiffusionPipelineProtocol {
-    internal func randomSource(from rng: StableDiffusionRNG, seed: UInt32) -> RandomSource {
+    public func randomSource(from rng: StableDiffusionRNG, seed: UInt32) -> RandomSource {
         switch rng {
         case .numpyRNG:
             return NumPyRandomSource(seed: seed)
@@ -566,11 +584,11 @@ extension StableDiffusionPipelineProtocol {
         return states
     }
 
-    func performGuidance(_ noise: [MLShapedArray<Float32>], _ guidanceScale: Float) -> [MLShapedArray<Float32>] {
+    public func performGuidance(_ noise: [MLShapedArray<Float32>], _ guidanceScale: Float) -> [MLShapedArray<Float32>] {
         noise.map { performGuidance($0, guidanceScale) }
     }
 
-    func performGuidance(_ noise: MLShapedArray<Float32>, _ guidanceScale: Float) -> MLShapedArray<Float32> {
+    public func performGuidance(_ noise: MLShapedArray<Float32>, _ guidanceScale: Float) -> MLShapedArray<Float32> {
         var shape = noise.shape
         shape[0] = 1
         return MLShapedArray<Float>(unsafeUninitializedShape: shape) { result, _ in

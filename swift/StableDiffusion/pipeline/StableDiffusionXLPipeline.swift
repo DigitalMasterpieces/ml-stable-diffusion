@@ -20,23 +20,23 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     public typealias Configuration = PipelineConfiguration
 
     /// Model to generate embeddings for tokenized input text
-    var textEncoder: TextEncoderXLModel?
-    var textEncoder2: TextEncoderXLModel
+    public var textEncoder: TextEncoderXLModel?
+    public var textEncoder2: TextEncoderXLModel
 
     /// Model to generate embeddings for constraint image to be used with IP-Adapters
-    var imageEncoder: ImageEncoderXLModel?
+    public var imageEncoder: ImageEncoderXLModel?
 
     /// Model used to predict noise residuals given an input, diffusion time step, and conditional embedding
     public var unet: Unet
-    
+
     /// Model used to refine the image, if present
     public var unetRefiner: Unet?
 
     /// Model used to generate final image from latent diffusion process
-    var decoder: Decoder
-    
+    public var decoder: Decoder
+
     /// Model used to latent space for image2image, and soon, in-painting
-    var encoder: Encoder?
+    public var encoder: Encoder?
 
     /// Optional model used before Unet to control generated images by additonal inputs
     public var controlNet: ControlNetXLProtocol? = nil
@@ -55,7 +55,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     /// when needed and aggressively unload their resources after
     ///
     /// This will increase latency in favor of reducing memory
-    var reduceMemory: Bool = false
+    public var reduceMemory: Bool = false
 
     /// Creates a pipeline using the specified models and tokenizer
     ///
@@ -491,7 +491,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         return (embeds, pooled)
     }
 
-    func generateConditioning(using config: Configuration, forRefiner: Bool = false) throws -> ModelInputs {
+    public func generateConditioning(using config: Configuration, forRefiner: Bool = false) throws -> ModelInputs {
         // Encode the input prompt and negative prompt
         let (promptEmbedding, pooled) = try encodePrompt(config.prompt, forRefiner: forRefiner)
 
@@ -663,10 +663,20 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         return safeImages
     }
 
-    struct ModelInputs {
-        var hiddenStates: MLShapedArray<Float32>
-        var pooledStates: MLShapedArray<Float32>
-        var geometryConditioning: MLShapedArray<Float32>
+    public struct ModelInputs {
+        public var hiddenStates: MLShapedArray<Float32>
+        public var pooledStates: MLShapedArray<Float32>
+        public var geometryConditioning: MLShapedArray<Float32>
+
+        public init(
+            hiddenStates: MLShapedArray<Float32>,
+            pooledStates: MLShapedArray<Float32>,
+            geometryConditioning: MLShapedArray<Float32>
+        ) {
+            self.hiddenStates = hiddenStates
+            self.pooledStates = pooledStates
+            self.geometryConditioning = geometryConditioning
+        }
     }
 }
 
