@@ -18,6 +18,31 @@ extension CGImage {
         case wrongNumberOfChannels
         case incorrectFormatsConvertingToShapedArray
         case vImageConverterNotInitialized
+        case grayscaleContextCreationFailed
+    }
+
+    /// Renders this image into a `width × height` 1-channel grayscale UInt8 buffer using
+    /// high-quality interpolation (CoreGraphics dispatches the resample to vImage), then
+    /// invokes `body` with a pointer to the resulting pixels. The buffer is owned by the
+    /// underlying `CGContext` and is only valid for the duration of `body`.
+    public func withGrayscaleResampledPixels<T>(
+        width: Int,
+        height: Int,
+        _ body: (UnsafePointer<UInt8>) throws -> T
+    ) throws -> T {
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let ctx = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: width,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ), let data = ctx.data else {
+            throw ShapedArrayError.grayscaleContextCreationFailed
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let pixels = data.bindMemory(to: UInt8.self, capacity: width * height)
+        return try body(pixels)
     }
     
     public static func fromShapedArray(_ array: MLShapedArray<Float32>) throws -> CGImage {

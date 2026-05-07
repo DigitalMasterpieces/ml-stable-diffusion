@@ -105,6 +105,27 @@ public extension Scheduler {
 
         return noisySamples
     }
+
+    /// Add noise to a sample at a specific timestep.
+    /// Used for per-step re-noising during inpainting latent blending.
+    func addNoise(
+        originalSample: MLShapedArray<Float32>,
+        noise: MLShapedArray<Float32>,
+        timeStep t: Double
+    ) -> MLShapedArray<Float32> {
+        // Find the closest timestep index, or use the raw timestep for non-Karras schedulers
+        let timestepInt = Int(t.rounded())
+        let safeIndex = max(0, min(timestepInt, alphasCumProd.count - 1))
+        let alphaProdt = alphasCumProd[safeIndex]
+        let betaProdt = 1 - alphaProdt
+        let sqrtAlphaProdt = sqrt(alphaProdt)
+        let sqrtBetaProdt = sqrt(betaProdt)
+
+        return weightedSum(
+            [Double(sqrtAlphaProdt), Double(sqrtBetaProdt)],
+            [originalSample, noise]
+        )
+    }
 }
 
 // MARK: - Timesteps
