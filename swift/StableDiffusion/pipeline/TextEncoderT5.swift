@@ -51,6 +51,7 @@ public struct TextEncoderT5: TextEncoderT5Model {
 
     /// Ensure the model has been loaded into memory
     public func loadResources(progress: Progress, prewarm: Bool) throws {
+        progress.rootProgress?.localizedDescription = "Text Encoder T5"
         try model.loadResources(progress: progress)
         if prewarm {
             self.unloadResources()

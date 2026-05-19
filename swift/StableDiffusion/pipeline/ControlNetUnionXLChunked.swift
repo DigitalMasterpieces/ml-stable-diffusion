@@ -78,6 +78,7 @@ public struct ControlNetUnionXLChunked: ResourceManaging, ControlNetXLProtocol {
 
     /// Load resources.
     public func loadResources(progress: Progress, prewarm: Bool) throws {
+        progress.rootProgress?.localizedDescription = "ControlNet Union (Chunked)"
         for (index, chunk) in chunks.enumerated() {
             let chunkProgress = Progress(totalUnitCount: loadProgressWeights[index], parent: progress, pendingUnitCount: loadProgressWeights[index])
             try chunk.loadResources(progress: chunkProgress)

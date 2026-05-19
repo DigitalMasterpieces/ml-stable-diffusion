@@ -49,6 +49,7 @@ public struct MultilingualTextEncoder: TextEncoderModel {
 
     /// Loads model resources into memory.
     public func loadResources(progress: Progress, prewarm: Bool) throws {
+        progress.rootProgress?.localizedDescription = "Multilingual Text Encoder"
         try adapter?.loadResources(progress: progress)
         try embeddingModel.load()
         if prewarm {

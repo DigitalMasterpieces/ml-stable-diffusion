@@ -38,6 +38,7 @@ public struct MultiModalDiffusionTransformer: ResourceManaging {
 
     /// Load resources.
     public func loadResources(progress: Progress, prewarm: Bool) throws {
+        progress.rootProgress?.localizedDescription = "Multimodal Diffusion Transformer"
         for model in models {
             try model.loadResources(progress: progress)
             if prewarm {

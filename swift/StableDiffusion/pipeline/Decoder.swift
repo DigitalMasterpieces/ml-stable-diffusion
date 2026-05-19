@@ -35,6 +35,7 @@ public struct Decoder: ResourceManaging {
 
     /// Ensure the model has been loaded into memory
     public func loadResources(progress: Progress, prewarm: Bool) throws {
+        progress.rootProgress?.localizedDescription = "Decoder"
         try model.loadResources(progress: progress)
         if prewarm {
             self.unloadResources()

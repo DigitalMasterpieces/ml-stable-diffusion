@@ -41,6 +41,7 @@ public struct Encoder: ResourceManaging {
 
     /// Ensure the model has been loaded into memory
     public func loadResources(progress: Progress, prewarm: Bool) throws {
+        progress.rootProgress?.localizedDescription = "Encoder"
         try model.loadResources(progress: progress)
         if prewarm {
             self.unloadResources()

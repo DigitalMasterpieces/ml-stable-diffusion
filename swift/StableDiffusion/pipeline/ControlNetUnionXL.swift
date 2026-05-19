@@ -28,6 +28,7 @@ public struct ControlNetUnionXL: ResourceManaging, ControlNetXLProtocol {
 
     /// Load resources.
     public func loadResources(progress: Progress, prewarm: Bool) throws {
+        progress.rootProgress?.localizedDescription = "Control Net (Union)"
         for model in models {
             try model.loadResources(progress: progress)
             if prewarm {
