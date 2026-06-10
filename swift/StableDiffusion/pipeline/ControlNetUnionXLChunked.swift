@@ -165,11 +165,88 @@ public struct ControlNetUnionXLChunked: ResourceManaging, ControlNetXLProtocol {
         return [combinedDescriptions]
     }
 
+    /// **SpatialControlNet** — optional per-control-type **spatial** conditioning-scale maps,
+    /// indexed `[controlNetModel][controlType]`, each an `[1, H, W]` (latent-resolution) weight
+    /// map (or `H*W` scalars). When set, `execute` builds the model's
+    /// `conditioning_scale_spatial` input from these maps: per control type it uses the map if
+    /// present, otherwise a constant fill of that type's scalar from `conditioningScales`.
+    /// When `nil`, every type is filled uniformly from its scalar — identical to the legacy
+    /// scalar `conditioning_scale` behavior. Reset to `nil` to return to global scales.
+    ///
+    /// Note: the all-zero early-out still reads `conditioningScales`, so when driving with maps
+    /// pass representative non-zero scalars (e.g. each map's max) for the active types.
+    public var conditioningScaleMaps: [[MLShapedArray<Float32>?]]? = nil
+
+    /// **SpatialControlNet detection.** Whether this ControlNet was converted with SPATIAL
+    /// conditioning weights (the converter's `--spatial_controlnet` flag). The spatial
+    /// BetaCondFusion chunk declares `conditioning_scale_spatial` as a 4-D `[num, 1, H, W]`
+    /// map input; the default scalar chunk declares `conditioning_scale` as a 1-D `[num]`
+    /// vector. We detect the variant by querying that input's **rank** on the BetaCondFusion
+    /// chunk (rank ≥ 4 ⇒ spatial) and branch `execute` accordingly, so a single Swift build
+    /// drives either converted model. The spatial code path — building
+    /// `conditioning_scale_spatial`, honoring `conditioningScaleMaps`, and spatial residual
+    /// post-scaling — only applies when this is `true`; otherwise the legacy scalar
+    /// `conditioning_scale` path runs. Defaults to `false` (scalar) if the descriptor can't be
+    /// read (e.g. model not yet loaded).
+    public var isSpatialConditioning: Bool {
+        (try? chunks[1].perform { model in
+            let inputs = model.modelDescription.inputDescriptionsByName
+            let desc = inputs["conditioning_scale_spatial"] ?? inputs["conditioning_scale"]
+            let rank = desc?.multiArrayConstraint?.shape.count ?? 1
+            return rank >= 4
+        }) ?? false
+    }
+
+    /// Build the `conditioning_scale_spatial` tensor `[numControlTypes, 1, H, W]`. Each control
+    /// type's plane is its painted map (when provided and sized `>= H*W`) or a constant fill of
+    /// its scalar — so a uniform fill reproduces the legacy scalar `conditioning_scale[i]`.
+    private static func buildConditioningScaleSpatial(
+        scales: [Float],
+        maps: [MLShapedArray<Float32>?]?,
+        numControlTypes: Int,
+        latentH: Int,
+        latentW: Int
+    ) -> MLShapedArray<Float32> {
+        let plane = latentH * latentW
+        var scalars = [Float](repeating: 1.0, count: numControlTypes * plane)
+        for t in 0..<numControlTypes {
+            let base = t * plane
+            if let maps, t < maps.count, let map = maps[t] {
+                let mv = map.scalars
+                for k in 0..<plane { scalars[base + k] = k < mv.count ? mv[k] : 0 }
+            } else {
+                let s = t < scales.count ? scales[t] : 1.0
+                for k in 0..<plane { scalars[base + k] = s }
+            }
+        }
+        return MLShapedArray<Float32>(scalars: scalars, shape: [numControlTypes, 1, latentH, latentW])
+    }
+
+    /// Bilinear-resample a single-channel (row-major `[H, W]`) plane. Used to apply a spatial
+    /// conditioning-scale map to ControlNet residuals at each residual's own resolution.
+    private static func resamplePlane(_ src: [Float], srcW: Int, srcH: Int, dstW: Int, dstH: Int) -> [Float] {
+        if srcW == dstW && srcH == dstH { return src }
+        var s = src
+        var dst = [Float](repeating: 0, count: max(dstW * dstH, 1))
+        s.withUnsafeMutableBufferPointer { sp in
+            dst.withUnsafeMutableBufferPointer { dp in
+                var srcBuf = vImage_Buffer(
+                    data: sp.baseAddress, height: vImagePixelCount(srcH), width: vImagePixelCount(srcW),
+                    rowBytes: srcW * MemoryLayout<Float>.stride)
+                var dstBuf = vImage_Buffer(
+                    data: dp.baseAddress, height: vImagePixelCount(dstH), width: vImagePixelCount(dstW),
+                    rowBytes: dstW * MemoryLayout<Float>.stride)
+                _ = vImageScale_PlanarF(&srcBuf, &dstBuf, nil, vImage_Flags(kvImageHighQualityResampling))
+            }
+        }
+        return dst
+    }
+
     /// Execute chunked ControlNet Union prediction
     ///
     /// Data flow:
     /// - AlphaTimeEmbed: (timestep, control_type) → emb
-    /// - BetaCondFusion: (sample, controlnet_cond_*, conditioning_scale) → fused_sample
+    /// - BetaCondFusion: (sample, controlnet_cond_*, conditioning_scale_spatial) → fused_sample
     /// - GammaDown01: (fused_sample, emb, encoder_hidden_states) → (residuals 0-6, hidden [B, 640, H/4, W/4])
     /// - DeltaDown2A: (hidden, emb, encoder_hidden_states) → (residual 7, hidden [B, 1280, H/4, W/4])
     /// - DeltaDown2B: (hidden, emb, encoder_hidden_states) → (residual 8, hidden [B, 1280, H/4, W/4])
@@ -221,17 +298,35 @@ public struct ControlNetUnionXLChunked: ResourceManaging, ControlNetXLProtocol {
             controlType = MLShapedArray<Float32>(scalars: controlTypeFloats, shape: [1, numControlTypes])
         }
 
-        // Build conditioning_scale tensor from actual input scales
-        // conditioningScales is [[Float]] where first array has scales per control type
+        // Normalize the per-control-type scalar conditioning scales into `activeScales`
+        // (padded/truncated to `numControlTypes`). Both conditioning-weight variants use this:
+        // the scalar path feeds it directly as `conditioning_scale`, and the spatial path uses
+        // each scalar as the constant fill for any control type that has no painted map.
         let inputScales = conditioningScales.first ?? Array(repeating: 1.0, count: numControlTypes)
         var activeScales: [Float] = Array(repeating: 1.0, count: numControlTypes)
         for (i, scale) in inputScales.enumerated() where i < numControlTypes {
             activeScales[i] = scale
         }
-        let condScaleArray = MLShapedArray<Float32>(
-            scalars: activeScales,
-            shape: [numControlTypes]
-        )
+        guard let firstLatentShape = latents.first?.shape, firstLatentShape.count >= 4 else {
+            return outputs
+        }
+        let latentH = firstLatentShape[2]
+        let latentW = firstLatentShape[3]
+        // Detect once which conditioning-weight contract the converted model expects, and build
+        // only that tensor. Spatial (SpatialControlNet): per-type `[num, 1, H, W]` maps. Scalar
+        // (default): the legacy `[num]` vector.
+        let spatialConditioning = self.isSpatialConditioning
+        let condScaleSpatial: MLShapedArray<Float32>? = spatialConditioning
+            ? Self.buildConditioningScaleSpatial(
+                scales: activeScales,
+                maps: conditioningScaleMaps?.first,
+                numControlTypes: numControlTypes,
+                latentH: latentH,
+                latentW: latentW)
+            : nil
+        let condScaleScalar: MLShapedArray<Float32>? = spatialConditioning
+            ? nil
+            : MLShapedArray<Float32>(scalars: activeScales, shape: [numControlTypes])
 
         // Get expected image shape for creating zero placeholders for missing control types
         let expectedImageShape = self.inputImageShapes.first ?? [batchSize, 3, 1024, 1024]
@@ -255,12 +350,18 @@ public struct ControlNetUnionXLChunked: ResourceManaging, ControlNetXLProtocol {
             let emb = alphaResult.featureValue(for: "emb_out")!.multiArrayValue!
 
             // --- Stage 1: BetaCondFusion ---
-            // Inputs: sample, controlnet_cond_*, conditioning_scale
+            // Inputs: sample, controlnet_cond_*, and the conditioning weights under whichever
+            // key the converted model declares (`conditioning_scale_spatial` for the spatial /
+            // SpatialControlNet variant, `conditioning_scale` for the default scalar variant).
             // Outputs: fused_sample [B, 320, H, W]
             var betaInputs: [String: Any] = [
                 "sample": MLMultiArray(latent),
-                "conditioning_scale": MLMultiArray(condScaleArray),
             ]
+            if let condScaleSpatial {
+                betaInputs["conditioning_scale_spatial"] = MLMultiArray(condScaleSpatial)
+            } else if let condScaleScalar {
+                betaInputs["conditioning_scale"] = MLMultiArray(condScaleScalar)
+            }
 
             // BetaCondFusion expects ALL numControlTypes controlnet_cond inputs
             // Missing images should be zeros (with the conditioning applied correctly per type)
@@ -375,22 +476,76 @@ public struct ControlNetUnionXLChunked: ResourceManaging, ControlNetXLProtocol {
         }
 
         // Output-level scaling (matching diffusers ControlNetUnionModel behavior).
-        // In the monolithic model, the final residuals are multiplied by conditioning_scale[0]
-        // ONLY when a single control type is active (len(control_type_idx) == 1).
-        // With multiple active types, BetaCondFusion handles per-type weighting internally.
-        // This scaling was lost during architectural chunking since it happens after all
-        // encoder blocks, outside of any individual chunk.
+        // In the monolithic model, the final residuals are multiplied by the active type's
+        // conditioning scale ONLY when a single control type is active (len(control_type_idx)
+        // == 1) — in ADDITION to the per-type weighting BetaCondFusion already applied. We
+        // mirror that here.
+        //
+        // SpatialControlNet: the conditioning scale must be applied wherever the scalar path
+        // applies it. For a single active type the scalar scales BOTH in BetaCondFusion AND
+        // here — so a per-type SPATIAL map must too: each residual is multiplied by the active
+        // type's map resampled to that residual's resolution. A uniform map therefore behaves
+        // identically to the equivalent scalar; a varying map carries its spatial variation
+        // into the post step as well. (When no map drives the active type, fall back to the
+        // legacy scalar multiply.)
         let nonZeroScales = conditioningScales.first?.filter { $0 > 0.0 } ?? []
         let activeTypeCount = nonZeroScales.count
 
-        if activeTypeCount == 1, let effectiveScale = nonZeroScales.first, effectiveScale != 1.0 {
-            for n in 0..<outputs.count {
-                for key in outputs[n].keys {
-                    if let residual = outputs[n][key] {
-                        outputs[n][key] = MLShapedArray<Float32>(unsafeUninitializedShape: residual.shape) { ptr, _ in
-                            residual.withUnsafeShapedBufferPointer { src, _, _ in
-                                var scale = effectiveScale
-                                vDSP_vsmul(src.baseAddress!, 1, &scale, ptr.baseAddress!, 1, vDSP_Length(src.count))
+        if activeTypeCount == 1 {
+            // The single active type's spatial map, if one is driving it.
+            let activeIdx = conditioningScales.first?.firstIndex(where: { $0 > 0.0 })
+            let activeMap: MLShapedArray<Float32>? = {
+                // Spatial post-scaling applies only to the spatial-converted model; the scalar
+                // model always takes the legacy scalar branch below.
+                guard spatialConditioning,
+                      let maps = conditioningScaleMaps?.first, let idx = activeIdx,
+                      idx >= 0, idx < maps.count else { return nil }
+                return maps[idx]
+            }()
+
+            if let activeMap {
+                // Spatial post-scaling: residual[b,c,:,:] *= map resampled to the residual's h×w.
+                let mShape = activeMap.shape
+                let mapW = mShape.last ?? 0
+                let mapH = mShape.count >= 2 ? mShape[mShape.count - 2] : 0
+                let mapScalars = activeMap.scalars
+                if mapW > 0, mapH > 0 {
+                    for n in 0..<outputs.count {
+                        for key in outputs[n].keys {
+                            guard let residual = outputs[n][key], residual.shape.count == 4 else { continue }
+                            let bc = residual.shape[0] * residual.shape[1]
+                            let rh = residual.shape[2], rw = residual.shape[3]
+                            let plane = rh * rw
+                            guard plane > 0 else { continue }
+                            let resampled = (mapW == rw && mapH == rh)
+                                ? mapScalars
+                                : Self.resamplePlane(mapScalars, srcW: mapW, srcH: mapH, dstW: rw, dstH: rh)
+                            outputs[n][key] = MLShapedArray<Float32>(unsafeUninitializedShape: residual.shape) { ptr, _ in
+                                residual.withUnsafeShapedBufferPointer { src, _, _ in
+                                    let sp = src.baseAddress!
+                                    let op = ptr.baseAddress!
+                                    resampled.withUnsafeBufferPointer { rp in
+                                        let rb = rp.baseAddress!
+                                        for p in 0..<bc {
+                                            let base = p * plane
+                                            vDSP_vmul(sp + base, 1, rb, 1, op + base, 1, vDSP_Length(plane))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let effectiveScale = nonZeroScales.first, effectiveScale != 1.0 {
+                // Legacy scalar post-scaling (no map driving the active type).
+                for n in 0..<outputs.count {
+                    for key in outputs[n].keys {
+                        if let residual = outputs[n][key] {
+                            outputs[n][key] = MLShapedArray<Float32>(unsafeUninitializedShape: residual.shape) { ptr, _ in
+                                residual.withUnsafeShapedBufferPointer { src, _, _ in
+                                    var scale = effectiveScale
+                                    vDSP_vsmul(src.baseAddress!, 1, &scale, ptr.baseAddress!, 1, vDSP_Length(src.count))
+                                }
                             }
                         }
                     }

@@ -2491,7 +2491,7 @@ def convert_controlnet(pipe, args):
 def _get_controlnet_union_chunk_sample_inputs(
     chunk_name, batch_size, latent_h, latent_w,
     text_hidden_size, text_token_length, num_control_type,
-    controlnet=None
+    controlnet=None, spatial=False
 ):
     """Generate sample inputs for each ControlNet Union architectural chunk (6-chunk architecture).
 
@@ -2566,10 +2566,19 @@ def _get_controlnet_union_chunk_sample_inputs(
         # Add individual controlnet_cond inputs for each control type
         for i in range(num_control_type):
             inputs[f"controlnet_cond_{i}"] = torch.rand(*controlnet_cond_shape)
-        # conditioning_scale: [num_control_type]
-        # Use DISTINCT, non-trivial values (not all 1.0) to prevent CoreML's graph
-        # optimizer from constant-folding `feat_seq * scale` into identity.
-        inputs["conditioning_scale"] = torch.linspace(0.1, 0.9, num_control_type)
+        if spatial:
+            # SpatialControlNet: conditioning_scale_spatial: [num_control_type, 1, H, W] per-type
+            # SPATIAL weight maps at latent resolution (generalizes the [num_control_type]
+            # scalar vector). Seed with random, per-element-distinct values so CoreML's graph
+            # optimizer can't constant-fold the spatial multiply into identity. A spatially-
+            # uniform map reproduces the scalar conditioning_scale behavior; the Swift caller's
+            # scalar convenience fills constant maps.
+            inputs["conditioning_scale_spatial"] = torch.rand(num_control_type, 1, h, w)
+        else:
+            # Default scalar path: conditioning_scale [num_control_type]. Use DISTINCT,
+            # non-trivial values (not all 1.0) to prevent CoreML's graph optimizer from
+            # constant-folding `feat_seq * scale` into identity.
+            inputs["conditioning_scale"] = torch.linspace(0.1, 0.9, num_control_type)
         return inputs
 
     # -------------------------------------------------------------------------
@@ -2730,8 +2739,18 @@ def convert_controlnet_union_architectural_chunks(pipe, args):
 
             # Create chunk wrapper
             if chunk_name == "ControlNetBetaCondFusion":
-                # BetaCondFusion requires factory function for dynamic forward signature
-                chunk_module = make_beta_cond_fusion_chunk(reference_controlnet, num_control_type).eval()
+                # BetaCondFusion requires factory function for dynamic forward signature.
+                # `--spatial-controlnet` selects the spatial (SpatialControlNet) forward; the
+                # default is the scalar conditioning_scale forward.
+                if args.spatial_controlnet:
+                    logger.info("Converting BetaCondFusion with SPATIAL conditioning weights "
+                                "(SpatialControlNet, --spatial-controlnet).")
+                else:
+                    logger.info("Converting BetaCondFusion with scalar conditioning weights "
+                                "(default; pass --spatial-controlnet for SpatialControlNet).")
+                chunk_module = make_beta_cond_fusion_chunk(
+                    reference_controlnet, num_control_type, spatial=args.spatial_controlnet
+                ).eval()
             else:
                 chunk_class = CONTROLNET_UNION_CHUNK_CLASSES[chunk_name]
                 chunk_module = chunk_class(reference_controlnet).eval()
@@ -2740,7 +2759,7 @@ def convert_controlnet_union_architectural_chunks(pipe, args):
             sample_inputs = _get_controlnet_union_chunk_sample_inputs(
                 chunk_name, batch_size, latent_h, latent_w,
                 text_hidden_size, text_token_length, num_control_type,
-                controlnet=reference_controlnet
+                controlnet=reference_controlnet, spatial=args.spatial_controlnet
             )
 
             sample_inputs_spec = {}
@@ -3004,6 +3023,18 @@ def parser_spec():
         help=
         "ControlNet conversion mode: 'single' (default) converts to a single model, "
         "'architectural' splits into 4 chunks for Neural Engine compatibility on mobile devices.",
+    )
+    parser.add_argument(
+        "--spatial-controlnet",
+        action="store_true",
+        help=
+        "SpatialControlNet: convert the (architecturally-chunked Union) ControlNet so its "
+        "conditioning weights are per-control-type SPATIAL maps "
+        "(`conditioning_scale_spatial` of shape [num_control_type, 1, H, W] at latent "
+        "resolution) instead of the default scalar `conditioning_scale` [num_control_type]. "
+        "This lets each control type (Tile, Canny, ...) be weighted per location; a "
+        "spatially-uniform map reproduces the scalar behavior exactly. Only affects "
+        "'--controlnet-chunk-mode architectural'.",
     )
     parser.add_argument("--convert-image-encoder", action="store_true")
     parser.add_argument(

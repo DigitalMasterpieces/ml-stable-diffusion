@@ -120,7 +120,12 @@ class ControlNetBetaCondFusionChunkBase(nn.Module):
     Inputs:
         - sample: [B, 4, H, W] latent input
         - controlnet_cond_0 to _N: [B, 3, H*8, W*8] control images
-        - conditioning_scale: [num_conds] per-condition scaling
+        - conditioning weights — one of two variants, chosen at conversion time:
+            * scalar (default): `conditioning_scale` [num_control_type] per-condition scaling.
+            * spatial (`--spatial_controlnet`, SpatialControlNet): `conditioning_scale_spatial`
+              [num_control_type, 1, H, W] per-type spatial weight maps. A spatially-uniform map
+              reproduces the scalar `conditioning_scale[i]` behavior exactly.
+          `make_beta_cond_fusion_chunk(..., spatial=...)` selects which `forward` is traced.
 
     Outputs:
         - fused_sample: [B, 320, H, W] sample fused with conditioning
@@ -139,18 +144,21 @@ class ControlNetBetaCondFusionChunkBase(nn.Module):
 
         self.num_control_type = num_control_type
 
-    def forward_impl(
+    def forward_impl_scalar(
         self,
         sample: torch.Tensor,
         controlnet_cond: List[torch.Tensor],
         conditioning_scale: torch.Tensor,
     ):
         """
-        Internal forward implementation that takes a list of controlnet_cond tensors.
+        Scalar conditioning path (DEFAULT — produced WITHOUT `--spatial_controlnet`).
 
-        NOTE: We must use tensor indexing (conditioning_scale[i]) instead of .tolist()
-        because .tolist() is not traceable - it converts to Python values at JIT trace time,
-        causing the scale values to be baked in as constants.
+        `conditioning_scale` is a per-condition scalar vector [num_control_type]: a single
+        weight per control type, applied globally. This is the original ControlNet Union
+        behavior.
+
+        NOTE: index with tensor ops (conditioning_scale[i]) — never .tolist() — so the weights
+        stay runtime inputs and are not baked in as constants at JIT trace time.
         """
         num_cond = len(controlnet_cond)
 
@@ -205,13 +213,85 @@ class ControlNetBetaCondFusionChunkBase(nn.Module):
 
         return (fused_sample,)
 
+    def forward_impl_spatial(
+        self,
+        sample: torch.Tensor,
+        controlnet_cond: List[torch.Tensor],
+        conditioning_scale_spatial: torch.Tensor,
+    ):
+        """
+        Internal forward implementation that takes a list of controlnet_cond tensors.
 
-def make_beta_cond_fusion_chunk(controlnet, num_control_type: int):
+        SpatialControlNet: `conditioning_scale_spatial` is a per-control-type **spatial** weight
+        map of shape [num_control_type, 1, H, W] at latent resolution, generalizing the former
+        scalar `conditioning_scale[i]`. It gates each control type's conditioning *per
+        location*, so a unit (Tile, Canny, …) can be enforced strongly in one region and
+        relaxed in another. A spatially-uniform map reproduces the old scalar behavior exactly
+        (the Swift caller's scalar convenience fills a constant map). The global
+        transformer-fusion path operates on globally-pooled features, so it is fed the
+        per-type spatial mean.
+
+        NOTE: index with tensor ops (conditioning_scale_spatial[i]) — never .tolist() — so the
+        weights stay runtime inputs and are not baked in as constants at JIT trace time.
+
+        NOTE: unlike the former scalar path, the single-control case is no longer special-
+        cased to skip scaling — the spatial map is always applied (a uniform map of 1.0 is the
+        identity, so the common single-unit, full-strength case is unchanged).
+        """
+        # 1. Conv_in on sample
+        sample = self.conv_in(sample)
+
+        # 2. Conditioning embedding and fusion
+        inputs = []
+        condition_list = []
+
+        for i, cond in enumerate(controlnet_cond):
+            # Per-type spatial weight map [1, 1, H, W] (broadcasts over [B, C, H, W]); the
+            # global/pooled transformer path gets a representative scalar = the map's mean.
+            scale_map = conditioning_scale_spatial[i:i + 1]
+            scale_mean = conditioning_scale_spatial[i].mean()
+            condition = self.controlnet_cond_embedding(cond)
+            feat_seq = torch.mean(condition, dim=(2, 3))
+            feat_seq = feat_seq + self.task_embedding[i]
+            inputs.append(feat_seq.unsqueeze(1) * scale_mean)
+            condition_list.append(condition * scale_map)
+
+        # Add sample features (never scaled)
+        condition = sample
+        feat_seq = torch.mean(condition, dim=(2, 3))
+        inputs.append(feat_seq.unsqueeze(1))
+        condition_list.append(condition)
+
+        # Transformer fusion
+        x = torch.cat(inputs, dim=1)
+        for layer in self.transformer_layes:
+            x = layer(x)
+
+        # Spatial fusion
+        controlnet_cond_fuser = sample * 0.0
+        for idx, condition in enumerate(condition_list[:-1]):
+            # Same per-type spatial map gates the per-type bias `alpha` (broadcast to spatial).
+            scale_map = conditioning_scale_spatial[idx:idx + 1]
+            alpha = self.spatial_ch_projs(x[:, idx])
+            alpha = alpha.unsqueeze(-1).unsqueeze(-1)
+            controlnet_cond_fuser += condition + alpha * scale_map
+
+        fused_sample = sample + controlnet_cond_fuser
+
+        return (fused_sample,)
+
+
+def make_beta_cond_fusion_chunk(controlnet, num_control_type: int, spatial: bool = False):
     """
     Factory function to create ControlNetBetaCondFusionChunk with dynamic forward signature.
 
     This generates a forward method with the exact number of controlnet_cond_* arguments
     based on num_control_type, similar to how controlnetunion.make_controlnet works.
+
+    `spatial` selects which conditioning-weight contract the traced `forward` exposes:
+      * False (default): scalar `conditioning_scale` [num_control_type] → `forward_impl_scalar`.
+      * True (`--spatial_controlnet`, SpatialControlNet): `conditioning_scale_spatial`
+        [num_control_type, 1, H, W] → `forward_impl_spatial`.
     """
     # Generate argument names for controlnet_cond inputs
     cond_args = ", ".join([f"controlnet_cond_{i}: torch.Tensor"
@@ -219,20 +299,24 @@ def make_beta_cond_fusion_chunk(controlnet, num_control_type: int):
     cond_list = ", ".join([f"controlnet_cond_{i}"
                            for i in range(num_control_type)])
 
+    # Pick the conditioning-weight input name + the matching forward_impl_* by mode.
+    scale_arg = "conditioning_scale_spatial" if spatial else "conditioning_scale"
+    impl_name = "forward_impl_spatial" if spatial else "forward_impl_scalar"
+
     # Generate forward function source code
     src = f"""
 def forward(
     self,
     sample: torch.Tensor,
     {cond_args},
-    conditioning_scale: torch.Tensor,
+    {scale_arg}: torch.Tensor,
 ):
     controlnet_cond = [{cond_list}]
-    return ControlNetBetaCondFusionChunkBase.forward_impl(
+    return ControlNetBetaCondFusionChunkBase.{impl_name}(
         self,
         sample,
         controlnet_cond,
-        conditioning_scale,
+        {scale_arg},
     )
 """
 
