@@ -475,69 +475,75 @@ public struct ControlNetUnionXLChunked: ResourceManaging, ControlNetXLProtocol {
             }
         }
 
-        // Output-level scaling (matching diffusers ControlNetUnionModel behavior).
-        // In the monolithic model, the final residuals are multiplied by the active type's
-        // conditioning scale ONLY when a single control type is active (len(control_type_idx)
-        // == 1) — in ADDITION to the per-type weighting BetaCondFusion already applied. We
-        // mirror that here.
+        // Output-level (residual) scaling — the dominant-weight "max activator", applied PER
+        // LATENT COMPONENT so it covers the spatial (SpatialControlNet) case as well as scalar.
         //
-        // SpatialControlNet: the conditioning scale must be applied wherever the scalar path
-        // applies it. For a single active type the scalar scales BOTH in BetaCondFusion AND
-        // here — so a per-type SPATIAL map must too: each residual is multiplied by the active
-        // type's map resampled to that residual's resolution. A uniform map therefore behaves
-        // identically to the equivalent scalar; a varying map carries its spatial variation
-        // into the post step as well. (When no map drives the active type, fall back to the
-        // legacy scalar multiply.)
-        let nonZeroScales = conditioningScales.first?.filter { $0 > 0.0 } ?? []
-        let activeTypeCount = nonZeroScales.count
-
-        if activeTypeCount == 1 {
-            // The single active type's spatial map, if one is driving it.
-            let activeIdx = conditioningScales.first?.firstIndex(where: { $0 > 0.0 })
-            let activeMap: MLShapedArray<Float32>? = {
-                // Spatial post-scaling applies only to the spatial-converted model; the scalar
-                // model always takes the legacy scalar branch below.
-                guard spatialConditioning,
-                      let maps = conditioningScaleMaps?.first, let idx = activeIdx,
-                      idx >= 0, idx < maps.count else { return nil }
-                return maps[idx]
-            }()
-
-            if let activeMap {
-                // Spatial post-scaling: residual[b,c,:,:] *= map resampled to the residual's h×w.
-                let mShape = activeMap.shape
-                let mapW = mShape.last ?? 0
-                let mapH = mShape.count >= 2 ? mShape[mShape.count - 2] : 0
-                let mapScalars = activeMap.scalars
-                if mapW > 0, mapH > 0 {
-                    for n in 0..<outputs.count {
-                        for key in outputs[n].keys {
-                            guard let residual = outputs[n][key], residual.shape.count == 4 else { continue }
-                            let bc = residual.shape[0] * residual.shape[1]
-                            let rh = residual.shape[2], rw = residual.shape[3]
-                            let plane = rh * rw
-                            guard plane > 0 else { continue }
-                            let resampled = (mapW == rw && mapH == rh)
-                                ? mapScalars
-                                : Self.resamplePlane(mapScalars, srcW: mapW, srcH: mapH, dstW: rw, dstH: rh)
-                            outputs[n][key] = MLShapedArray<Float32>(unsafeUninitializedShape: residual.shape) { ptr, _ in
-                                residual.withUnsafeShapedBufferPointer { src, _, _ in
-                                    let sp = src.baseAddress!
-                                    let op = ptr.baseAddress!
-                                    resampled.withUnsafeBufferPointer { rp in
-                                        let rb = rp.baseAddress!
-                                        for p in 0..<bc {
-                                            let base = p * plane
-                                            vDSP_vmul(sp + base, 1, rb, 1, op + base, 1, vDSP_Length(plane))
-                                        }
+        // The per-type conditioning scale is already applied once at fusion by BetaCondFusion.
+        // On TOP of that we multiply the residuals by the dominant active weight — restoring the
+        // double-application that tuned the look (e.g. Tile@0.5 → `R = 0.5·B(c₀ + 0.5·Tile)`),
+        // but made CONTINUOUS across active-unit count by using the MAX active weight rather than
+        // the old `== 1` single-type gate (which made the second multiply VANISH the instant a
+        // second unit turned on — the ≈1/scale jump when enabling Canny).
+        //
+        // Same idea in two regimes:
+        //   • Scalar weights (default model, or a spatial-converted model in normal generation
+        //     with uniform fills, i.e. `conditioningScaleMaps == nil`): the dominant weight is a
+        //     single constant `max(active scales)` → one uniform residual multiply (fast path).
+        //     Byte-for-byte the prior scalar behavior.
+        //   • Spatial maps driving the pass (SpatialControlNet + `conditioningScaleMaps`, e.g.
+        //     Level of Abstraction): the dominant weight VARIES per location. Take the
+        //     per-location max ACROSS control types — `condScaleSpatial` already holds each
+        //     type's painted map / constant-scalar plane (inactive types are 0) — then resample
+        //     that single plane to each residual's own resolution and multiply element-wise. With
+        //     one active map this is exactly `residual *= map` (the pre-`max()` spatial post-
+        //     scaling that was committed, tuned, and working); with a uniform map it collapses to
+        //     the scalar case; mixing a map with a scalar unit keeps the per-location max, so the
+        //     continuity property holds everywhere.
+        if spatialConditioning, conditioningScaleMaps != nil, let condScaleSpatial {
+            // Per-location dominant weight: max over the control-type axis of the
+            // [numControlTypes, 1, latentH, latentW] fusion tensor.
+            let plane = latentH * latentW
+            let cs = condScaleSpatial.scalars
+            var maxPlane = [Float](repeating: 0.0, count: plane)
+            for tIdx in 0..<numControlTypes {
+                let base = tIdx * plane
+                for k in 0..<plane where cs[base + k] > maxPlane[k] {
+                    maxPlane[k] = cs[base + k]
+                }
+            }
+            // A uniformly-1.0 plane is the identity — nothing to rescale.
+            if !maxPlane.allSatisfy({ $0 == 1.0 }) {
+                for n in 0..<outputs.count {
+                    for key in outputs[n].keys {
+                        guard let residual = outputs[n][key], residual.shape.count == 4 else { continue }
+                        let bc = residual.shape[0] * residual.shape[1]
+                        let rh = residual.shape[2], rw = residual.shape[3]
+                        let rplane = rh * rw
+                        guard rplane > 0 else { continue }
+                        // Resample the latent-resolution dominant-weight plane to this residual's h×w.
+                        let weights = (rw == latentW && rh == latentH)
+                            ? maxPlane
+                            : Self.resamplePlane(maxPlane, srcW: latentW, srcH: latentH, dstW: rw, dstH: rh)
+                        outputs[n][key] = MLShapedArray<Float32>(unsafeUninitializedShape: residual.shape) { ptr, _ in
+                            residual.withUnsafeShapedBufferPointer { src, _, _ in
+                                let sp = src.baseAddress!
+                                let op = ptr.baseAddress!
+                                weights.withUnsafeBufferPointer { wp in
+                                    let wb = wp.baseAddress!
+                                    // Broadcast the single h×w plane across batch × channels.
+                                    for p in 0..<bc {
+                                        let b = p * rplane
+                                        vDSP_vmul(sp + b, 1, wb, 1, op + b, 1, vDSP_Length(rplane))
                                     }
                                 }
                             }
                         }
                     }
                 }
-            } else if let effectiveScale = nonZeroScales.first, effectiveScale != 1.0 {
-                // Legacy scalar post-scaling (no map driving the active type).
+            }
+        } else {
+            let nonZeroScales = conditioningScales.first?.filter { $0 > 0.0 } ?? []
+            if let effectiveScale = nonZeroScales.max(), effectiveScale != 1.0 {
                 for n in 0..<outputs.count {
                     for key in outputs[n].keys {
                         if let residual = outputs[n][key] {
