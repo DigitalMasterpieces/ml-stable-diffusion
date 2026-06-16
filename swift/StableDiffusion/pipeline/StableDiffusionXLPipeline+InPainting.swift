@@ -39,8 +39,15 @@ extension StableDiffusionXLPipeline {
         /// Fixed noise tensor used to re-noise the original at each timestep
         /// (the diffusers reference reuses a single noise sample across steps).
         let noise: MLShapedArray<Float32>
-        /// Binary mask in latent space: shape `[1, 1, latentH, latentW]`.
-        /// `1` = regenerate (denoised wins), `0` = preserve (re-noised original wins).
+        /// **Continuous** mask in latent space: shape `[1, 1, latentH, latentW]`, values in
+        /// `[0, 1]`. `1` = regenerate (denoised wins), `0` = preserve (re-noised original
+        /// wins); intermediate values blend proportionally. Mirrors the diffusers
+        /// `StableDiffusionXLControlNetUnionInpaintPipeline` reference, which interpolates
+        /// the user mask to latent resolution **without** thresholding so the blend has a
+        /// feathered ring of fractional-weight latent pixels at the mask boundary. Hard
+        /// binarising at latent resolution (previous implementation) produced a
+        /// 1-latent-pixel ≈ 8-output-pixel step transition that the VAE had to materialise,
+        /// which read as boundary smearing / desaturation in the decoded image.
         let maskLatent: MLShapedArray<Float32>
     }
 
@@ -86,8 +93,9 @@ extension StableDiffusionXLPipeline {
             converting: noiseRandom.normalShapedArray(sampleShape, mean: 0.0, stdev: 1.0)
         )
 
-        // Downsample the user-supplied mask image to latent resolution with a binary threshold.
-        let maskLatent = try Self.makeBinaryLatentMask(
+        // Downsample the user-supplied mask image to latent resolution as a continuous
+        // [0, 1] float field (no threshold — see `makeLatentMask` for why).
+        let maskLatent = try Self.makeLatentMask(
             from: maskCGImage,
             latentH: sampleShape[2],
             latentW: sampleShape[3]
@@ -97,9 +105,18 @@ extension StableDiffusionXLPipeline {
     }
 
     /// Downsamples `maskCGImage` to a 1-channel grayscale buffer at latent resolution
-    /// (via `CGImage.withGrayscaleResampledPixels`), then thresholds at 0.5 with vDSP
-    /// to produce a binary `[1, 1, H, W]` latent mask.
-    private static func makeBinaryLatentMask(
+    /// (via `CGImage.withGrayscaleResampledPixels`, which uses CoreGraphics + vImage with
+    /// `interpolationQuality = .high`), then normalises to `[0, 1]` Float **without
+    /// thresholding**. The high-quality resample produces interpolated values along the
+    /// mask boundary; we keep those fractional weights so the per-step blend in
+    /// `blendStepLatents` is a feathered transition at latent resolution.
+    ///
+    /// Matches the diffusers `StableDiffusionXLControlNetUnionInpaintPipeline` semantic
+    /// (`F.interpolate` of the pixel-space-binarised mask to latent resolution yields
+    /// continuous boundary weights). The previous implementation hard-binarised at
+    /// latent resolution, which produced a 1-latent-pixel-wide step transition the VAE
+    /// had to materialise as a smeared / desaturated ring in pixel space.
+    private static func makeLatentMask(
         from maskCGImage: CGImage,
         latentH: Int,
         latentW: Int
@@ -107,19 +124,22 @@ extension StableDiffusionXLPipeline {
         let count = latentH * latentW
         var maskScalars = [Float32](repeating: 0, count: count)
 
-        // Vectorized UInt8 -> {0.0, 1.0} via vDSP:
-        //   1. convert UInt8 pixels (0..255) to Float32
-        //   2. vDSP_vlim maps each value to +0.5 if >= 128, else -0.5
-        //   3. vDSP_vsadd shifts by +0.5 to land on {1.0, 0.0}
+        // UInt8 (0..255) → Float32, scaled into [0, 1] in a single vDSP pass.
+        // `vDSP.convertElements` widens the bytes to Float32 in-place; `vDSP_vsmul` with
+        // `1/255` scales into the unit interval. We clamp defensively at the end since the
+        // CoreGraphics resample could in theory emit values slightly outside [0, 255]
+        // under bizarre colour-management conditions (in practice it doesn't, but the
+        // clamp is one vDSP call and removes the precondition from the blend kernel).
         do {
             try maskCGImage.withGrayscaleResampledPixels(width: latentW, height: latentH) { pixels in
                 maskScalars.withUnsafeMutableBufferPointer { buf in
                     var bufLocal = buf
                     vDSP.convertElements(of: UnsafeBufferPointer(start: pixels, count: count), to: &bufLocal)
-                    var threshold: Float = 128.0
-                    var half: Float = 0.5
-                    vDSP_vlim(buf.baseAddress!, 1, &threshold, &half, buf.baseAddress!, 1, vDSP_Length(count))
-                    vDSP_vsadd(buf.baseAddress!, 1, &half, buf.baseAddress!, 1, vDSP_Length(count))
+                    var scale: Float = 1.0 / 255.0
+                    vDSP_vsmul(buf.baseAddress!, 1, &scale, buf.baseAddress!, 1, vDSP_Length(count))
+                    var low: Float = 0
+                    var high: Float = 1
+                    vDSP_vclip(buf.baseAddress!, 1, &low, &high, buf.baseAddress!, 1, vDSP_Length(count))
                 }
             }
         } catch {
