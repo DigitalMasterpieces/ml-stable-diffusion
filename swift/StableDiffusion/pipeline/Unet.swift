@@ -205,6 +205,7 @@ public struct Unet: ResourceManaging {
         additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil,
         imageEmbeds: MLShapedArray<Float32>? = nil,
         ipAdapterBlockScales: [Float]? = nil,
+        ipAdapterBlockScaleMaps: [Int: [Float]]? = nil,
         reduceMemory: Bool = false
     ) throws -> [MLShapedArray<Float32>] {
         // Determine chunk mode for signpost message.
@@ -228,6 +229,32 @@ public struct Unet: ResourceManaging {
             t = MLShapedArray<Float32>(scalars: [Float(timeStep)], shape: [1])
         }
 
+        // SpatialIPAdapter auto-detection. A `--spatial-ip-adapter` converted UNet
+        // declares some `ip_adapter_scale_block_<i>` inputs as rank-4 spatial maps ([1,1,1,H*W])
+        // rather than rank-1 scalars ([1]); a scalar-converted UNet declares them all rank-1.
+        // Scan each chunk's input descriptions once and record, per block index, the spatial
+        // sequence length S (= H*W) so we feed the matching tensor below. Empty for scalar models
+        // (everything then stays on the existing scalar path). Cheap metadata reads on already-
+        // loaded chunks; only performed when IP-Adapter is active.
+        let ipScalePrefix = "ip_adapter_scale_block_"
+        var spatialIPScaleSizes: [Int: Int] = [:]
+        if ipAdapterBlockScales != nil {
+            for managed in models {
+                let found: [(Int, Int)] = (try? managed.perform { model in
+                    var out: [(Int, Int)] = []
+                    for (name, desc) in model.modelDescription.inputDescriptionsByName {
+                        guard name.hasPrefix(ipScalePrefix),
+                              let shape = desc.multiArrayConstraint?.shape.map({ $0.intValue }),
+                              shape.count >= 4,
+                              let idx = Int(name.dropFirst(ipScalePrefix.count)) else { continue }
+                        out.append((idx, shape.last ?? shape.reduce(1, *)))
+                    }
+                    return out
+                }) ?? []
+                for (idx, s) in found { spatialIPScaleSizes[idx] = s }
+            }
+        }
+
         // Form batch input to model
         let inputs = try latents.enumerated().map {
             var dict: [String: Any] = [
@@ -244,8 +271,26 @@ public struct Unet: ResourceManaging {
             }
             if let blockScales = ipAdapterBlockScales {
                 for (index, scale) in blockScales.enumerated() {
-                    let scaleArray = MLShapedArray<Float32>(scalars: [scale], shape: [1])
-                    dict["ip_adapter_scale_block_\(index)"] = MLMultiArray(scaleArray)
+                    if let s = spatialIPScaleSizes[index] {
+                        // Spatial style scale (SpatialIPAdapter): feed a [1,1,1,S] map. Use the
+                        // caller-supplied painted map when present (it must already be resampled
+                        // to this block's S = H*W); otherwise a uniform fill of the scalar — a
+                        // behavioral no-op vs. the scalar path, so an un-painted spatial model
+                        // reproduces the old scalar result exactly.
+                        let map: MLShapedArray<Float32>
+                        if let provided = ipAdapterBlockScaleMaps?[index], provided.count == s {
+                            map = MLShapedArray<Float32>(scalars: provided, shape: [1, 1, 1, s])
+                        } else {
+                            map = MLShapedArray<Float32>(
+                                scalars: [Float](repeating: scale, count: s),
+                                shape: [1, 1, 1, s]
+                            )
+                        }
+                        dict["ip_adapter_scale_block_\(index)"] = MLMultiArray(map)
+                    } else {
+                        let scaleArray = MLShapedArray<Float32>(scalars: [scale], shape: [1])
+                        dict["ip_adapter_scale_block_\(index)"] = MLMultiArray(scaleArray)
+                    }
                 }
             }
             if let imageEmbeds = imageEmbeds {

@@ -41,6 +41,16 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     /// Optional model used before Unet to control generated images by additonal inputs
     public var controlNet: ControlNetXLProtocol? = nil
 
+    /// Optional per-step background latents for **trajectory-pinned inpainting**. When set on an
+    /// `.inPainting` call, `InPaintingContext` pins the unmasked region to `[stepIndex]` of this
+    /// array each step (the source generation's actual `x_t`) instead of forward-re-noising the
+    /// finished `startingImage`. This makes the ControlNet/UNet see source-faithful context at
+    /// every step, so the masked fill co-evolves exactly as the source did (→ matching
+    /// stylization) while the seam stays continuous. Must be the same length / step schedule as
+    /// the inpaint run; otherwise the context falls back to forward-re-noising. nil = legacy
+    /// behavior. Carried here (not on `Configuration`) so `Configuration` stays `Hashable`.
+    public var inpaintBackgroundTrajectory: [MLShapedArray<Float32>]? = nil
+
     /// Optional model for checking safety of generated image
     var safetyChecker: SafetyChecker? = nil
 
@@ -186,6 +196,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         var refinerInput: ModelInputs?
         var imageInputEmbeddings: ImageEncoderXLModel.ImageEncoderXLOutput?
         var ipAdapterBlockScales: [Float]?
+        var ipAdapterBlockScaleMaps: [Int: [Float]]?
 
         // Report encoding phase before text encoding starts
         let encodingProgress = PipelineProgress(
@@ -213,6 +224,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                     try imageEncoder.encode(imageInput)
                 }
                 ipAdapterBlockScales = config.ipAdapterBlockScales
+                ipAdapterBlockScaleMaps = config.ipAdapterBlockScaleMaps
             } else {
                 ipAdapterBlockScales = Array(repeating: 0.0, count: 11)
             }
@@ -395,6 +407,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 additionalResiduals: additionalResiduals,
                 imageEmbeds: imageInputEmbeddings,
                 ipAdapterBlockScales: ipAdapterBlockScales,
+                ipAdapterBlockScaleMaps: ipAdapterBlockScaleMaps,
                 reduceMemory: self.reduceMemory
             )
 
@@ -443,6 +456,10 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
                 step: step,
                 stepCount: timeSteps.count,
                 currentLatentSamples: currentLatentSamples,
+                // Always the raw noisy x_t (post-step), regardless of `useDenoisedIntermediates`
+                // — lets a caller capture the generation's full latent trajectory for
+                // trajectory-pinned inpainting without disturbing the preview.
+                rawLatentSamples: latents,
                 configuration: config,
                 phase: .denoising
             )

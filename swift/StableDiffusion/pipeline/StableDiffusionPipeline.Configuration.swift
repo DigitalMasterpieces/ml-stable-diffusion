@@ -36,6 +36,15 @@ public struct PipelineConfiguration: Hashable {
     /// Higher values will result in fewer refiner steps
     /// Per-block IP-Adapter scales for the 11 attention blocks (nil = no IP-Adapter).
     public var ipAdapterBlockScales: [Float]? = nil
+    /// SpatialIPAdapter: optional per-block SPATIAL style-scale maps, keyed by global
+    /// IP-Adapter block index (e.g. 3 and 6 for InstantStyle). Each value is the flat, row-major
+    /// `H*W` weight plane at that block's latent resolution; `Unet` reshapes it to the model's
+    /// `[1, 1, 1, H*W]` input and feeds it in place of the scalar so the artist can paint WHERE
+    /// the image-prompt style applies. Only honored by a `--spatial-ip-adapter` converted UNet
+    /// (the Swift side auto-detects per-block via the input rank); a scalar UNet ignores it, and
+    /// an absent/wrong-length entry falls back to the scalar broadcast. nil = uniform (scalar)
+    /// style. Kept as `[Float]` (not `MLShapedArray`) so `Configuration` stays `Hashable`.
+    public var ipAdapterBlockScaleMaps: [Int: [Float]]? = nil
     public var refinerStart: Float = 0.8
     /// Number of images to generate
     public var imageCount: Int = 1

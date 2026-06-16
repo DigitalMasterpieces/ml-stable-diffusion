@@ -526,6 +526,11 @@ public struct PipelineProgress {
     public let step: Int
     public let stepCount: Int
     public let currentLatentSamples: [MLShapedArray<Float32>]
+    /// Raw noisy latents (x_t) at this step, **independent** of `useDenoisedIntermediates`
+    /// (which makes `currentLatentSamples` carry the decoded-preview x₀ estimate instead).
+    /// Populated during the denoising loop so a caller can record a generation's full latent
+    /// trajectory (for trajectory-pinned inpainting); empty in other phases.
+    public let rawLatentSamples: [MLShapedArray<Float32>]
     public let configuration: PipelineConfiguration
     public let phase: Phase
     public var isSafetyEnabled: Bool {
@@ -541,6 +546,7 @@ public struct PipelineProgress {
         step: Int,
         stepCount: Int,
         currentLatentSamples: [MLShapedArray<Float32>],
+        rawLatentSamples: [MLShapedArray<Float32>] = [],
         configuration: PipelineConfiguration,
         phase: Phase
     ) {
@@ -549,6 +555,7 @@ public struct PipelineProgress {
         self.step = step
         self.stepCount = stepCount
         self.currentLatentSamples = currentLatentSamples
+        self.rawLatentSamples = rawLatentSamples
         self.configuration = configuration
         self.phase = phase
     }

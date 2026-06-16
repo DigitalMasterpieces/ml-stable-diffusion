@@ -1708,6 +1708,21 @@ def _get_architectural_chunk_sample_inputs(
     # ControlNet support flag
     support_controlnet = getattr(args, 'unet_support_controlnet', False)
 
+    # SpatialIPAdapter flag. When set, ALL 11 IP-Adapter per-block style-scale inputs are traced
+    # as [1, 1, 1, H*W] spatial maps (each at ITS OWN attention latent resolution) instead of [1]
+    # scalars, so the user can specify WHERE the image-prompt style applies, per block. The
+    # attention processor's `scale.expand_as(attn_image)` broadcasts a [1,1,1,H*W] map over the
+    # [B,C,1,H*W] image-attention output unchanged. A non-uniform example (torch.rand, not ones)
+    # keeps coremltools from constant-folding the broadcast multiply into identity.
+    #
+    # Per-block attention resolutions (must match the example shape exactly):
+    #   - blocks 0,1   = down_blocks[1].attn[0,1]            → h2×w2 (64×64 @ 1024)
+    #   - blocks 2,3   = down_blocks[2].attn[0,1]            → h4×w4 (32×32)
+    #   - block  4     = mid_block.attn                      → h4×w4
+    #   - blocks 5,6,7 = up_blocks[0].attn[0,1,2]            → h4×w4
+    #   - blocks 8,9,10= up_blocks[1].attn[0,1,2]            → h2×w2
+    spatial_ip = getattr(args, 'spatial_ip_adapter', False)
+
     if chunk_name == "SDXLAlphaEncoderA":
         # Time embedding computation only - minimal inputs
         inputs = OrderedDict([
@@ -1737,8 +1752,13 @@ def _get_architectural_chunk_sample_inputs(
             else:
                 image_embeds_shape = (batch_size, 1, image_enc_cfg.projection_dim)
             inputs["image_embeds"] = torch.rand(*image_embeds_shape)
-            inputs["ip_adapter_scale_block_0"] = torch.tensor([1.0])
-            inputs["ip_adapter_scale_block_1"] = torch.tensor([1.0])
+            # Blocks 0,1 = down_blocks[1].attn[0,1], at h2×w2 (64×64).
+            inputs["ip_adapter_scale_block_0"] = (
+                torch.rand(1, 1, 1, h2 * w2) if spatial_ip else torch.tensor([1.0])
+            )
+            inputs["ip_adapter_scale_block_1"] = (
+                torch.rand(1, 1, 1, h2 * w2) if spatial_ip else torch.tensor([1.0])
+            )
         # Add ControlNet residual inputs if enabled
         # AlphaEncoderB handles: conv_in (0) + down_blocks[0] (1,2,3) + down_blocks[1] (4,5,6)
         if support_controlnet:
@@ -1760,7 +1780,10 @@ def _get_architectural_chunk_sample_inputs(
         ])
         if image_encoder is not None:
             inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
-            inputs["ip_adapter_scale_block_2"] = torch.tensor([1.0])
+            # Block 2 = down_blocks[2].attn[0], at h4×w4 (32×32).
+            inputs["ip_adapter_scale_block_2"] = (
+                torch.rand(1, 1, 1, h4 * w4) if spatial_ip else torch.tensor([1.0])
+            )
         if support_controlnet:
             inputs["additional_residual_7"] = torch.rand(batch_size, 1280, h4, w4)  # down_blocks[2].resnets[0]
         return inputs
@@ -1774,7 +1797,10 @@ def _get_architectural_chunk_sample_inputs(
         ])
         if image_encoder is not None:
             inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
-            inputs["ip_adapter_scale_block_3"] = torch.tensor([1.0])
+            # Global block 3 = down_blocks[2].attn[1] (InstantStyle "down.block_2"), at h4×w4 (32×32).
+            inputs["ip_adapter_scale_block_3"] = (
+                torch.rand(1, 1, 1, h4 * w4) if spatial_ip else torch.tensor([1.0])
+            )
         if support_controlnet:
             inputs["additional_residual_8"] = torch.rand(batch_size, 1280, h4, w4)  # down_blocks[2].resnets[1]
         return inputs
@@ -1788,7 +1814,10 @@ def _get_architectural_chunk_sample_inputs(
         ])
         if image_encoder is not None:
             inputs["ip_hidden_states"] = torch.rand(*ip_hidden_states_shape)
-            inputs["ip_adapter_scale_block_4"] = torch.tensor([1.0])
+            # Block 4 = mid_block.attn, at h4×w4 (32×32).
+            inputs["ip_adapter_scale_block_4"] = (
+                torch.rand(1, 1, 1, h4 * w4) if spatial_ip else torch.tensor([1.0])
+            )
         # Add ControlNet residual input if enabled
         # SigmaCore handles: mid_block (9) - same spatial dims as hidden
         if support_controlnet:
@@ -1807,7 +1836,10 @@ def _get_architectural_chunk_sample_inputs(
             ("skip_0", torch.rand(batch_size, 1280, h4, w4)),  # from down_blocks[2] resnet 1 (skip_down2_1)
         ])
         if image_encoder is not None:
-            inputs["ip_adapter_scale_block_5"] = torch.tensor([1.0])
+            # Block 5 = up_blocks[0].attn[0], at h4×w4 (32×32).
+            inputs["ip_adapter_scale_block_5"] = (
+                torch.rand(1, 1, 1, h4 * w4) if spatial_ip else torch.tensor([1.0])
+            )
         return inputs
 
     elif chunk_name == "SDXLThetaUpblockB":
@@ -1821,7 +1853,10 @@ def _get_architectural_chunk_sample_inputs(
             ("skip_0", torch.rand(batch_size, 1280, h4, w4)),  # from down_blocks[2] resnet 0 (skip_down2_0)
         ])
         if image_encoder is not None:
-            inputs["ip_adapter_scale_block_6"] = torch.tensor([1.0])
+            # Global block 6 = up_blocks[0].attn[1] (InstantStyle "up.block_0"), at h4×w4 (32×32).
+            inputs["ip_adapter_scale_block_6"] = (
+                torch.rand(1, 1, 1, h4 * w4) if spatial_ip else torch.tensor([1.0])
+            )
         return inputs
 
     elif chunk_name == "SDXLThetaUpblockC":
@@ -1835,7 +1870,11 @@ def _get_architectural_chunk_sample_inputs(
             ("skip_0", torch.rand(batch_size, 640, h4, w4)),   # from down_blocks[1] downsampler (skip_down1_2)
         ])
         if image_encoder is not None:
-            inputs["ip_adapter_scale_block_7"] = torch.tensor([1.0])
+            # Block 7 = up_blocks[0].attn[2], at h4×w4 (32×32) — the attention runs before this
+            # chunk's upsampler, so it's still at the 32×32 level.
+            inputs["ip_adapter_scale_block_7"] = (
+                torch.rand(1, 1, 1, h4 * w4) if spatial_ip else torch.tensor([1.0])
+            )
         return inputs
 
     elif chunk_name == "SDXLLambdaUpblock":
@@ -1851,9 +1890,16 @@ def _get_architectural_chunk_sample_inputs(
             ("skip_2", torch.rand(batch_size, 320, h2, w2)),   # skip[3] from down_blocks[0] downsampler
         ])
         if image_encoder is not None:
-            inputs["ip_adapter_scale_block_8"] = torch.tensor([1.0])
-            inputs["ip_adapter_scale_block_9"] = torch.tensor([1.0])
-            inputs["ip_adapter_scale_block_10"] = torch.tensor([1.0])
+            # Blocks 8,9,10 = up_blocks[1].attn[0,1,2], at h2×w2 (64×64).
+            inputs["ip_adapter_scale_block_8"] = (
+                torch.rand(1, 1, 1, h2 * w2) if spatial_ip else torch.tensor([1.0])
+            )
+            inputs["ip_adapter_scale_block_9"] = (
+                torch.rand(1, 1, 1, h2 * w2) if spatial_ip else torch.tensor([1.0])
+            )
+            inputs["ip_adapter_scale_block_10"] = (
+                torch.rand(1, 1, 1, h2 * w2) if spatial_ip else torch.tensor([1.0])
+            )
         return inputs
 
     elif chunk_name == "SDXLKappaUpblock":
@@ -3035,6 +3081,20 @@ def parser_spec():
         "This lets each control type (Tile, Canny, ...) be weighted per location; a "
         "spatially-uniform map reproduces the scalar behavior exactly. Only affects "
         "'--controlnet-chunk-mode architectural'.",
+    )
+    parser.add_argument(
+        "--spatial-ip-adapter",
+        action="store_true",
+        help=
+        "SpatialIPAdapter: convert the architecturally-chunked UNet so the "
+        "IP-Adapter style-scale inputs become per-location SPATIAL maps "
+        "(`ip_adapter_scale_block_3` and `_6`, shape [1, 1, 1, H*W] at the 32x32 latent "
+        "level) instead of the default scalar [1]. This lets the user specify WHERE the "
+        "image-prompt style applies. The attention processor's existing "
+        "`scale.expand_as(attn_image)` already broadcasts a [1,1,1,H*W] map over the "
+        "[B,C,1,H*W] image-attention output, so the graph adapts with no model-code change; "
+        "a spatially-uniform map reproduces the scalar behavior exactly. Only affects the "
+        "architecturally-chunked UNet conversion.",
     )
     parser.add_argument("--convert-image-encoder", action="store_true")
     parser.add_argument(

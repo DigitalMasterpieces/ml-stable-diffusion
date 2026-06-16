@@ -49,6 +49,13 @@ extension StableDiffusionXLPipeline {
         /// 1-latent-pixel ≈ 8-output-pixel step transition that the VAE had to materialise,
         /// which read as boundary smearing / desaturation in the decoded image.
         let maskLatent: MLShapedArray<Float32>
+        /// Optional per-step background latents — the **source generation's actual `x_t`**, one
+        /// per denoising step (index = step). When present (and shape/length-compatible),
+        /// `blendStepLatents` pins the unmasked region to `[stepIndex]` instead of forward-
+        /// re-noising the finished `imageLatent`. This makes the ControlNet/UNet context the
+        /// masked fill co-evolves against match the source's denoising path exactly (→ the fill
+        /// stylizes like the source), while the seam stays continuous. nil = legacy behavior.
+        let backgroundTrajectory: [MLShapedArray<Float32>]?
     }
 
     /// Build an `InPaintingContext` if all prerequisites (`startingImage`, `maskImage`,
@@ -101,7 +108,14 @@ extension StableDiffusionXLPipeline {
             latentW: sampleShape[3]
         )
 
-        return InPaintingContext(imageLatent: imageLatent, noise: noise, maskLatent: maskLatent)
+        return InPaintingContext(
+            imageLatent: imageLatent,
+            noise: noise,
+            maskLatent: maskLatent,
+            // Trajectory-pinned background (the source generation's per-step x_t), set by the
+            // caller on the pipeline. Length/shape are validated per-step in `blendStepLatents`.
+            backgroundTrajectory: self.inpaintBackgroundTrajectory
+        )
     }
 
     /// Downsamples `maskCGImage` to a 1-channel grayscale buffer at latent resolution
@@ -168,9 +182,18 @@ extension StableDiffusionXLPipeline.InPaintingContext {
         stepIndex: Int
     ) -> MLShapedArray<Float32> {
         let background: MLShapedArray<Float32>
-        if stepIndex < timeSteps.count - 1 {
-            // Re-noise the original at the *next* timestep so it matches the noise
-            // level of `denoised` after the scheduler step we just took.
+        if let traj = backgroundTrajectory,
+           stepIndex >= 0, stepIndex < traj.count,
+           traj[stepIndex].shape == denoised.shape {
+            // Trajectory-pinned: use the SOURCE generation's actual x_t at this step (captured
+            // post-scheduler-step, same noise level as `denoised`). Pinning to the real path —
+            // rather than `imageLatent` (the finished image) re-noised forward — makes the
+            // unmasked context (and thus the ControlNet/UNet residuals the masked fill sees)
+            // match the source's denoising exactly, so the fill co-evolves into the same style.
+            background = traj[stepIndex]
+        } else if stepIndex < timeSteps.count - 1 {
+            // Legacy fallback: re-noise the finished original at the *next* timestep so it
+            // matches the noise level of `denoised` after the scheduler step we just took.
             let nextTimeStep = timeSteps[stepIndex + 1]
             if let euler = scheduler as? DiscreteEulerScheduler {
                 background = euler.addNoise(
