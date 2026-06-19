@@ -196,7 +196,7 @@ def quantize_weights(args):
     # (quantization loses the isOptional flag)
     controlnet_optional_inputs = ["additional_residual", "image_embeds", "ip_adapter_scale_block"]
 
-    for model_name in ["text_encoder", "text_encoder_2", "image_encoder", "unet", "refiner"]:
+    for model_name in ["text_encoder", "text_encoder_2", "image_encoder", "unet", "refiner", "safety_checker"]:
         logger.info(f"Quantizing {model_name} to {args.quantize_nbits}-bit precision")
         out_path = _get_out_path(args, model_name)
         # unet has optional ip_adapter_scale_block_* inputs that need restoring
