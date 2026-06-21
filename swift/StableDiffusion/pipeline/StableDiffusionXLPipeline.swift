@@ -59,13 +59,17 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         safetyChecker != nil
     }
 
-    /// Option to reduce memory during image generation
+    /// Evaluated on demand to decide whether to reduce memory during image generation.
     ///
-    /// If true, the pipeline will lazily load TextEncoder, Unet, Decoder, and SafetyChecker
-    /// when needed and aggressively unload their resources after
-    ///
-    /// This will increase latency in favor of reducing memory
-    public var reduceMemory: Bool = false
+    /// Provided by the caller so the decision can track live system memory pressure rather than a
+    /// fixed value: when it returns `true` the pipeline lazily loads TextEncoder, Unet, Decoder, and
+    /// SafetyChecker as needed and aggressively unloads their resources between phases (lower peak
+    /// memory, higher latency); when it returns `false` the components stay resident.
+    let shouldReduceMemory: @Sendable () -> Bool
+
+    /// Whether to reduce memory right now. Evaluated dynamically so per-phase unloading tracks live
+    /// memory pressure across the lifetime of a generation.
+    public var reduceMemory: Bool { self.shouldReduceMemory() }
 
     /// Creates a pipeline using the specified models and tokenizer
     ///
@@ -76,7 +80,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
     ///   - decoder: Model for decoding latent sample to image
     ///   - controlNet: Optional model to control generated images by additonal inputs
     ///   - safetyChecker: Optional model for checking safety of generated images
-    ///   - reduceMemory: Option to enable reduced memory mode
+    ///   - reduceMemory: Closure evaluated on demand to enable reduced memory mode
     /// - Returns: Pipeline ready for image generation
     public init(
         textEncoder: TextEncoderXLModel?,
@@ -88,7 +92,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         encoder: Encoder?,
         controlNet: ControlNetXLProtocol? = nil,
         safetyChecker: SafetyChecker? = nil,
-        reduceMemory: Bool = false
+        reduceMemory: @escaping @Sendable () -> Bool = { false }
     ) {
         self.textEncoder = textEncoder
         self.textEncoder2 = textEncoder2
@@ -99,7 +103,7 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
         self.encoder = encoder
         self.controlNet = controlNet
         self.safetyChecker = safetyChecker
-        self.reduceMemory = reduceMemory
+        self.shouldReduceMemory = reduceMemory
     }
 
     /// Maximum user-visible content tokens the primary text encoder accepts for a prompt.

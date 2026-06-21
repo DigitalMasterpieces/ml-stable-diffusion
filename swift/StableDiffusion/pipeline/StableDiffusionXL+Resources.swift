@@ -158,7 +158,7 @@ public extension StableDiffusionXLPipeline {
             encoder: encoder,
             controlNet: controlNet,
             safetyChecker: safetyChecker,
-            reduceMemory: reduceMemory
+            reduceMemory: { reduceMemory }
         )
     }
 
@@ -293,7 +293,7 @@ public extension StableDiffusionXLPipeline {
             encoder: encoder,
             controlNet: controlNet,
             safetyChecker: safetyChecker,
-            reduceMemory: reduceMemory
+            reduceMemory: { reduceMemory }
         )
     }
 }
